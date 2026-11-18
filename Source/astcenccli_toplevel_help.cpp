@@ -603,13 +603,19 @@ COMPRESSION FILE FORMATS
 
     * Texel format must be R, RG, RGB, BGR, RGBA, BGRA, L, or LA.
     * Texture topology must be 2D, 2D-array, 3D, or cube-map.
-    * Only the first mipmap level, cube face, or 2D array layer will be
-      read.
+    * KTX mipmap chains are compressed in full, with each level encoded
+      separately. The level count and level dimensions must describe a
+      complete chain, and each level image size must match its dimensions.
+    * Only the first cube face or 2D array layer will be read.
 
     The following formats are supported as compression outputs:
 
     * ASTC (*.astc)
     * Khronos Texture KTX (*.ktx)
+
+    A compressed KTX output retains the full mipmap chain. The raw ASTC
+    output format cannot store a mipmap chain, so only the base level is
+    written, and a warning is emitted if the input had more levels.
 
 DECOMPRESSION FILE FORMATS
 

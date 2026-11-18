@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <string>
 #include <string_view>
 
 #include <zlib.h>
@@ -91,7 +92,19 @@ static bool get_deflate_size(
 bool print_compression_metrics(
 	const astc_compressed_image& img
 ) {
-	std::string_view data(reinterpret_cast<const char*>(img.data.data()), img.data.size());
+	if (img.levels.empty())
+	{
+		return true;
+	}
+
+	// Measure the full payload; a mipmap chain is one stored texture, not a set of images
+	std::string data;
+	data.reserve(img.levels[0].data.size());
+	for (const astc_compressed_level& level : img.levels)
+	{
+		data.append(reinterpret_cast<const char*>(level.data.data()), level.data.size());
+	}
+
 	size_t comp_size;
 	bool is_compression_error = get_deflate_size(data, comp_size);
 	if (is_compression_error)
@@ -105,6 +118,11 @@ bool print_compression_metrics(
 	double data_sized = static_cast<double>(data.size()) / 1024.0;
 	double comp_sized = static_cast<double>(comp_size) / 1024.0;
 	double comp_percent = 100.0 * comp_sized / data_sized;
+
+	if (img.levels.size() > 1)
+	{
+		printf("    %-27s%8zu\n",             "ASTC mip levels:",   img.levels.size());
+	}
 
 	printf("    %-27s%8.1f KB\n",          "ASTC data size:",    data_sized);
 	printf("    %-27s%8.1f KB (%.2f%%)\n", "ASTC DEFLATE size:", comp_sized, comp_percent);

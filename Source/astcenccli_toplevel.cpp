@@ -532,7 +532,7 @@ static std::string get_slice_filename(
 }
 
 /**
- * @brief Load an uncompressed image from disk, optionally from slice files.
+ * @brief Load an uncompressed image from disk, optionally from slice files, with all mip levels.
  *
  * @param      filename          The file to load, or a pattern for array loads.
  * @param      dim_z             The number of slices to load.
@@ -540,21 +540,21 @@ static std::string get_slice_filename(
  * @param[out] is_hdr            Is the loaded image HDR?
  * @param[out] component_count   The number of components in the loaded image.
  *
- * @return The loaded image, or @c nullptr on error.
+ * @return The loaded levels, with the base level first, or an empty vector on error.
  */
-static astcenc_image_ptr load_uncomp_file(
+static std::vector<astcenc_image_ptr> load_uncomp_file_mips(
 	const char* filename,
 	size_t dim_z,
 	bool y_flip,
 	bool& is_hdr,
 	unsigned int& component_count
 ) {
-	astcenc_image_ptr image;
+	std::vector<astcenc_image_ptr> levels;
 
 	// Load 2D images directly
 	if (dim_z == 1)
 	{
-		return load_ncimage(filename, y_flip, is_hdr, component_count);
+		return load_ncimage_mips(filename, y_flip, is_hdr, component_count);
 	}
 	else
 	{
@@ -621,11 +621,11 @@ static astcenc_image_ptr load_uncomp_file(
 			int bitness = is_hdr ? 16 : 8;
 			size_t slice_size = dim_x * dim_y;
 
-			image = alloc_image(bitness, dim_x, dim_y, dim_z);
+			astcenc_image_ptr image = alloc_image(bitness, dim_x, dim_y, dim_z);
 			if (!image)
 			{
 				print_error("ERROR: Image memory size overflow\n");
-				return nullptr;
+				return levels;
 			}
 
 			// Combine 2D source images into one 3D image
@@ -654,10 +654,12 @@ static astcenc_image_ptr load_uncomp_file(
 					memcpy(data32, data32src, copy_size);
 				}
 			}
+
+			levels.push_back(std::move(image));
 		}
 	}
 
-	return image;
+	return levels;
 }
 
 /**
@@ -2180,7 +2182,7 @@ static void print_diagnostic_image(
 	size_t block_cols = astc::get_block_count_safe(image.dim_x, image.block_x);
 	size_t block_rows = astc::get_block_count_safe(image.dim_y, image.block_y);
 
-	const uint8_t* data = image.data.data();
+	const uint8_t* data = image.levels[0].data.data();
 	for (size_t block_y = 0; block_y < block_rows; block_y++)
 	{
 		for (size_t block_x = 0; block_x < block_cols; block_x++)
@@ -2219,7 +2221,7 @@ static void print_diagnostic_images(
 	const astc_compressed_image& image,
 	const std::string& output_file
 ) {
-	if (image.dim_z != 1)
+	if (image.dim_z != 1 || image.levels.empty())
 	{
 		return;
 	}
@@ -2670,13 +2672,13 @@ int astcenc_main(
 		config.progress_callback = progress_emitter;
 	}
 
-	astcenc_image_ptr image_uncomp_in_storage;
+	std::vector<astcenc_image_ptr> image_uncomp_in_storage;
 	astcenc_image* image_uncomp_in = nullptr;
 	astcenc_image image_crop {};
 	std::vector<void*> crop_slices;
 	unsigned int image_uncomp_in_component_count = 0;
 	bool image_uncomp_in_is_hdr = false;
-	astcenc_image_ptr image_decomp_out;
+	std::vector<astcenc_image_ptr> image_decomp_storage;
 
 	astcenc_error codec_status;
 	astcenc_context_ptr codec_context;
@@ -2716,18 +2718,27 @@ int astcenc_main(
 	{
 		// A cropped image must be flipped after selecting the region
 		bool is_y_flip_needed = cli_config.y_flip && !cli_config.is_crop_requested;
-		image_uncomp_in_storage = load_uncomp_file(
+		image_uncomp_in_storage = load_uncomp_file_mips(
 		    input_filename.c_str(), cli_config.array_size, is_y_flip_needed,
 		    image_uncomp_in_is_hdr, image_uncomp_in_component_count);
-		image_uncomp_in = image_uncomp_in_storage.get();
-		if (!image_uncomp_in)
+		if (image_uncomp_in_storage.empty())
 		{
 			print_error("ERROR: Failed to load uncompressed image file\n");
 			return 1;
 		}
 
+		image_uncomp_in = image_uncomp_in_storage[0].get();
+
 		if (cli_config.is_crop_requested)
 		{
+			// A crop selects a region of a single image; a mipmap chain cannot be cropped without
+			// defining how the region scales, so reject the combination explicitly
+			if (image_uncomp_in_storage.size() > 1)
+			{
+				print_error("ERROR: Crop options are not supported for mipmap chain inputs\n");
+				return 1;
+			}
+
 			error = image_crop_view(*image_uncomp_in, cli_config, crop_slices, image_crop);
 			if (error)
 			{
@@ -2766,8 +2777,8 @@ int astcenc_main(
 					}
 				}
 
-				image_uncomp_in_storage = std::move(image_flipped);
-				image_uncomp_in = image_uncomp_in_storage.get();
+				image_uncomp_in_storage[0] = std::move(image_flipped);
+				image_uncomp_in = image_uncomp_in_storage[0].get();
 			}
 		}
 
@@ -2780,31 +2791,37 @@ int astcenc_main(
 
 		if (preprocess != ASTCENC_PP_NONE)
 		{
-			// Use float storage to preserve fractional color values during preprocessing
-			auto image_pp = alloc_image(32,
-			                            image_uncomp_in->dim_x,
-			                            image_uncomp_in->dim_y,
-			                            image_uncomp_in->dim_z);
-			if (!image_pp)
+			// Preprocess every level, preserving fractional color values in float storage
+			for (astcenc_image_ptr& level : image_uncomp_in_storage)
 			{
-				print_error("ERROR: Failed to allocate preprocessed image\n");
-				return 1;
-			}
+				const astcenc_image& level_in = *level;
 
-			if (preprocess == ASTCENC_PP_NORMALIZE)
-			{
-				image_preprocess_normalize(*image_uncomp_in, *image_pp);
-			}
+				auto image_pp = alloc_image(32,
+				                            level_in.dim_x,
+				                            level_in.dim_y,
+				                            level_in.dim_z);
+				if (!image_pp)
+				{
+					print_error("ERROR: Failed to allocate preprocessed image\n");
+					return 1;
+				}
 
-			if (preprocess == ASTCENC_PP_PREMULTIPLY)
-			{
-				image_preprocess_premultiply(*image_uncomp_in, *image_pp,
-				                             config.profile);
-			}
+				if (preprocess == ASTCENC_PP_NORMALIZE)
+				{
+					image_preprocess_normalize(level_in, *image_pp);
+				}
 
-			image_uncomp_in_storage = std::move(image_pp);
-			image_uncomp_in = image_uncomp_in_storage.get();
+				if (preprocess == ASTCENC_PP_PREMULTIPLY)
+				{
+					image_preprocess_premultiply(level_in, *image_pp, config.profile);
+				}
+
+				level = std::move(image_pp);
+			}
 		}
+
+		// The loaders apply any requested Y flip to every level, so all levels share orientation
+		image_uncomp_in = image_uncomp_in_storage[0].get();
 
 		if (!cli_config.silentmode)
 		{
@@ -2822,7 +2839,8 @@ int astcenc_main(
 				printf("    Dimensions:                 2D, %zux%zu\n",
 				       image_uncomp_in->dim_x, image_uncomp_in->dim_y);
 			}
-			printf("    Components:                 %d\n\n", image_uncomp_in_component_count);
+			printf("    Components:                 %d\n", image_uncomp_in_component_count);
+			printf("    Mipmap levels:              %zu\n\n", image_uncomp_in_storage.size());
 		}
 	}
 
@@ -2890,33 +2908,9 @@ int astcenc_main(
 	{
 		print_astcenc_config(cli_config, config);
 
-		size_t blocks_x = astc::get_block_count_safe(image_uncomp_in->dim_x, config.block_x);
-		size_t blocks_y = astc::get_block_count_safe(image_uncomp_in->dim_y, config.block_y);
-		size_t blocks_z = astc::get_block_count_safe(image_uncomp_in->dim_z, config.block_z);
+		image_comp.levels.clear();
+		image_comp.levels.resize(image_uncomp_in_storage.size());
 
-		bool overflow { false };
-
-		size_t buffer_size = astc::mul_safe(blocks_x, blocks_y, overflow);
-		buffer_size = astc::mul_safe(buffer_size, blocks_z, overflow);
-		buffer_size = astc::mul_safe(buffer_size, 16, overflow);
-		if (overflow)
-		{
-			print_error("ERROR: Image memory size overflow\n");
-			return 1;
-		}
-
-		image_comp.data.resize(buffer_size);
-
-		compression_workload work;
-		work.context = codec_context.get();
-		work.image = image_uncomp_in;
-		work.swizzle = cli_config.swz_encode;
-		work.data_out = image_comp.data.data();
-		work.data_len = buffer_size;
-		work.error = ASTCENC_SUCCESS;
-
-		// Only launch worker threads for multi-threaded use - it makes basic single-threaded
-		// profiling and debugging a little less convoluted
 		double start_compression_time = get_time();
 
 		if (config.progress_callback)
@@ -2926,19 +2920,63 @@ int astcenc_main(
 			printf("\n");
 		}
 
-		if (cli_config.thread_count > 1)
+		for (size_t level = 0; level < image_uncomp_in_storage.size(); level++)
 		{
-			launch_threads("Compression", cli_config.thread_count,
-			               compression_workload_runner, &work);
-		}
-		else
-		{
-			work.error = astcenc_compress_image(
-			    work.context, work.image, &work.swizzle,
-			    work.data_out, work.data_len, 0);
-		}
+			const astcenc_image* level_image = image_uncomp_in_storage[level].get();
 
-		astcenc_compress_reset(codec_context.get());
+			size_t blocks_x = astc::get_block_count_safe(level_image->dim_x, config.block_x);
+			size_t blocks_y = astc::get_block_count_safe(level_image->dim_y, config.block_y);
+			size_t blocks_z = astc::get_block_count_safe(level_image->dim_z, config.block_z);
+
+			bool overflow { false };
+
+			size_t buffer_size = astc::mul_safe(blocks_x, blocks_y, overflow);
+			buffer_size = astc::mul_safe(buffer_size, blocks_z, overflow);
+			buffer_size = astc::mul_safe(buffer_size, 16, overflow);
+			if (overflow)
+			{
+				print_error("ERROR: Image memory size overflow\n");
+				return 1;
+			}
+
+			astc_compressed_level& level_comp = image_comp.levels[level];
+			level_comp.data.resize(buffer_size);
+
+			compression_workload work;
+			work.context = codec_context.get();
+			work.image = const_cast<astcenc_image*>(level_image);
+			work.swizzle = cli_config.swz_encode;
+			work.data_out = level_comp.data.data();
+			work.data_len = buffer_size;
+			work.error = ASTCENC_SUCCESS;
+
+			// Only launch worker threads for multi-threaded use - it makes basic single-threaded
+			// profiling and debugging a little less convoluted
+			if (cli_config.thread_count > 1)
+			{
+				launch_threads("Compression", cli_config.thread_count,
+				               compression_workload_runner, &work);
+			}
+			else
+			{
+				work.error = astcenc_compress_image(
+				    work.context, work.image, &work.swizzle,
+				    work.data_out, work.data_len, 0);
+			}
+
+			astcenc_compress_reset(codec_context.get());
+
+			if (work.error != ASTCENC_SUCCESS)
+			{
+				print_error("ERROR: Codec compress failed: %s\n",
+				            astcenc_get_error_string(work.error));
+				return 1;
+			}
+
+			level_comp.dim_x = level_image->dim_x;
+			level_comp.dim_y = level_image->dim_y;
+			level_comp.dim_z = level_image->dim_z;
+		}
 
 		if (config.progress_callback)
 		{
@@ -2946,13 +2984,6 @@ int astcenc_main(
 		}
 
 		compression_time = get_time() - start_compression_time;
-
-		if (work.error != ASTCENC_SUCCESS)
-		{
-			print_error("ERROR: Codec compress failed: %s\n",
-			            astcenc_get_error_string(work.error));
-			return 1;
-		}
 
 		image_comp.block_x = config.block_x;
 		image_comp.block_y = config.block_y;
@@ -2967,55 +2998,61 @@ int astcenc_main(
 	bool is_decompression_warning = false;
 	if (operation & ASTCENC_STAGE_DECOMPRESS)
 	{
-		image_decomp_out = alloc_image(
-		    out_bitness, image_comp.dim_x, image_comp.dim_y, image_comp.dim_z);
-		if (!image_decomp_out)
-		{
-			print_error("ERROR: Image memory size overflow\n");
-			return 1;
-		}
+		image_decomp_storage.clear();
+		image_decomp_storage.reserve(image_comp.levels.size());
 
-		decompression_workload work;
-		work.context = codec_context.get();
-		work.data = image_comp.data.data();
-		work.data_len = image_comp.data.size();
-		work.image_out = image_decomp_out.get();
-		work.swizzle = cli_config.swz_decode;
-		work.error = ASTCENC_SUCCESS;
-
-		// Only launch worker threads for multi-threaded use - it makes basic single-threaded
-		// profiling and debugging a little less convoluted
 		double start_decompression_time = get_time();
 
-		if (cli_config.thread_count > 1)
+		for (const astc_compressed_level& level_comp : image_comp.levels)
 		{
-			launch_threads("Decompression", cli_config.thread_count,
-			               decompression_workload_runner, &work);
-		}
-		else
-		{
-			work.error = astcenc_decompress_image(
-			    work.context, work.data, work.data_len,
-			    work.image_out, &work.swizzle, 0);
-		}
+			image_decomp_storage.push_back(alloc_image(
+			    out_bitness, level_comp.dim_x, level_comp.dim_y, level_comp.dim_z));
+			astcenc_image_ptr& level_out = image_decomp_storage.back();
+			if (!level_out)
+			{
+				print_error("ERROR: Image memory size overflow\n");
+				return 1;
+			}
 
-		astcenc_decompress_reset(codec_context.get());
+			decompression_workload work;
+			work.context = codec_context.get();
+			work.data = const_cast<uint8_t*>(level_comp.data.data());
+			work.data_len = level_comp.data.size();
+			work.image_out = level_out.get();
+			work.swizzle = cli_config.swz_decode;
+			work.error = ASTCENC_SUCCESS;
+
+			// Only launch worker threads for multi-threaded use - it makes basic single-threaded
+			// profiling and debugging a little less convoluted
+			if (cli_config.thread_count > 1)
+			{
+				launch_threads("Decompression", cli_config.thread_count,
+				               decompression_workload_runner, &work);
+			}
+			else
+			{
+				work.error = astcenc_decompress_image(
+				    work.context, work.data, work.data_len,
+				    work.image_out, &work.swizzle, 0);
+			}
+
+			astcenc_decompress_reset(codec_context.get());
+
+			astcenc_error decode_status = work.error.load();
+			if (decode_status == ASTCENC_ERR_BAD_BLOCK)
+			{
+				print_error("WARNING: Invalid or unsupported blocks decoded as error colors\n");
+				is_decompression_warning = true;
+			}
+			else if (decode_status != ASTCENC_SUCCESS)
+			{
+				print_error("ERROR: Codec decompress failed: %s\n",
+				            astcenc_get_error_string(decode_status));
+				return 1;
+			}
+		}
 
 		decompression_time = get_time() - start_decompression_time;
-
-
-		astcenc_error decode_status = work.error.load();
-		if (decode_status == ASTCENC_ERR_BAD_BLOCK)
-		{
-			print_error("WARNING: Invalid or unsupported blocks decoded as error colors\n");
-			is_decompression_warning = true;
-		}
-		else if (decode_status != ASTCENC_SUCCESS)
-		{
-			print_error("ERROR: Codec decompress failed: %s\n",
-			            astcenc_get_error_string(decode_status));
-			return 1;
-		}
 	}
 
 	// Print metrics in comparison mode
@@ -3031,11 +3068,21 @@ int astcenc_main(
 			cli_config.high_fstop = fstop + 2;
 		}
 
-		compute_error_metrics(
-		    image_uncomp_in_is_hdr, is_normal_map,
-		    image_uncomp_in_component_count,
-		    image_uncomp_in, image_decomp_out.get(),
-		    cli_config.low_fstop, cli_config.high_fstop);
+		// Report metrics for each level, so a mip chain can be evaluated per level
+		for (size_t level = 0; level < image_decomp_storage.size(); level++)
+		{
+			if (image_decomp_storage.size() > 1)
+			{
+				const astcenc_image* level_image = image_uncomp_in_storage[level].get();
+				printf("Mip level %zu: %zux%zu\n", level, level_image->dim_x, level_image->dim_y);
+			}
+
+			compute_error_metrics(
+			    image_uncomp_in_is_hdr, is_normal_map,
+			    image_uncomp_in_component_count,
+			    image_uncomp_in_storage[level].get(), image_decomp_storage[level].get(),
+			    cli_config.low_fstop, cli_config.high_fstop);
+		}
 	}
 
 	// Store compressed image
@@ -3075,15 +3122,27 @@ int astcenc_main(
 	{
 		if (!is_null)
 		{
+			if (image_decomp_storage.empty())
+			{
+				print_error("ERROR: No decompressed image levels to write\n");
+				return 1;
+			}
+
 			bool is_store_error;
 			if (is_ldr_exposure_output)
 			{
-				is_store_error = store_ldr_exposures(*image_decomp_out, output_filename, cli_config);
+				if (image_decomp_storage.size() > 1)
+				{
+					printf("WARNING: Only the first of %zu mipmap levels will be written\n",
+					       image_decomp_storage.size());
+				}
+
+				is_store_error = store_ldr_exposures(*image_decomp_storage[0], output_filename, cli_config);
 			}
 			else
 			{
-				is_store_error = store_ncimage(image_decomp_out.get(), output_filename.c_str(),
-				                              cli_config.y_flip);
+				is_store_error = store_ncimage_mips(image_decomp_storage, output_filename.c_str(),
+				                                    cli_config.y_flip);
 			}
 
 			if (is_store_error)

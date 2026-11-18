@@ -38,7 +38,28 @@
 #define ASTCENC_UNUSED(x) ((void)x)
 
 /**
+ * @brief The payload stored in one level of a compressed ASTC image.
+ */
+struct astc_compressed_level
+{
+	/** @brief The image width in texels. */
+	size_t dim_x { 0 };
+
+	/** @brief The image height in texels. */
+	size_t dim_y { 0 };
+
+	/** @brief The image depth in texels. */
+	size_t dim_z { 0 };
+
+	/** @brief The binary data payload. */
+	std::vector<uint8_t> data;
+};
+
+/**
  * @brief The payload stored in a compressed ASTC image.
+ *
+ * A compressed image always contains at least one level. Level 0 is the base level, and any
+ * additional levels form a mipmap chain in decreasing size order.
  */
 struct astc_compressed_image
 {
@@ -51,17 +72,17 @@ struct astc_compressed_image
 	/** @brief The block depth in texels. */
 	unsigned int block_z { 0 };
 
-	/** @brief The image width in texels. */
+	/** @brief The base level image width in texels. */
 	size_t dim_x { 0 };
 
-	/** @brief The image height in texels. */
+	/** @brief The base level image height in texels. */
 	size_t dim_y { 0 };
 
-	/** @brief The image depth in texels. */
+	/** @brief The base level image depth in texels. */
 	size_t dim_z { 0 };
 
-	/** @brief The binary data payload. */
-	std::vector<uint8_t> data;
+	/** @brief The compressed mipmap levels, with level 0 first. */
+	std::vector<astc_compressed_level> levels;
 };
 
 /**
@@ -174,7 +195,26 @@ astcenc_image_ptr load_ncimage(
 	unsigned int& component_count);
 
 /**
- * @brief Load uncompressed PNG image.
+ * @brief Load an uncompressed image, including any mipmap levels.
+ *
+ * Formats which support mipmap chains return one image per level, with the base level first. All
+ * other formats return a single level. Level images within a chain all use the same data type.
+ *
+ * @param      filename          The file path on disk.
+ * @param      y_flip            Should this image be Y flipped?
+ * @param[out] is_hdr            Is the loaded image HDR?
+ * @param[out] component_count   The number of components in the loaded image.
+ *
+ * @return The loaded levels, or an empty vector on error.
+ */
+std::vector<astcenc_image_ptr> load_ncimage_mips(
+	const char* filename,
+	bool y_flip,
+	bool& is_hdr,
+	unsigned int& component_count);
+
+/**
+ * @brief Load an uncompressed PNG image.
  *
  * @param      filename          The file path on disk.
  * @param      y_flip            Should this image be Y flipped?
@@ -200,6 +240,23 @@ astcenc_image_ptr load_png_with_wuffs(
  */
 bool store_ncimage(
 	const astcenc_image* img,
+	const char* filename,
+	int y_flip);
+
+/**
+ * @brief Store an uncompressed image, including any mipmap levels.
+ *
+ * Formats which support mipmap chains write every level. All other formats write the base level
+ * only, and emit a warning if more than one level was supplied.
+ *
+ * @param levels     The source data for the image, with the base level first.
+ * @param filename   The name of the file to save.
+ * @param y_flip     Should the image be vertically flipped?
+ *
+ * @return @c true on error, @c false on success.
+ */
+bool store_ncimage_mips(
+	const std::vector<astcenc_image_ptr>& levels,
 	const char* filename,
 	int y_flip);
 

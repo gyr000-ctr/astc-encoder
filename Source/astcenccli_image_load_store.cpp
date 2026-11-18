@@ -418,7 +418,7 @@ large number of pixel formats.
 The following restrictions apply to loading of these file formats:
 
     * Only uncompressed data supported
-    * Only first mipmap in mipmap pyramid supported
+    * KTX: mipmap chains are supported; only first array layer or face is read
     * KTX: Cube-map arrays are not supported
 ============================================================================ */
 enum scanline_transfer
@@ -960,6 +960,56 @@ static void ktx_header_switch_endianness(ktx_header * kt)
 }
 
 /**
+ * @brief Get the number of mipmap levels in a full chain for an image size.
+ *
+ * @param dim_x   The base level width in texels.
+ * @param dim_y   The base level height in texels.
+ * @param dim_z   The base level depth in texels.
+ *
+ * @return The maximum number of levels, including the base level.
+ */
+static size_t get_mip_level_count(
+	size_t dim_x,
+	size_t dim_y,
+	size_t dim_z
+) {
+	size_t max_dim = astc::max(dim_x, astc::max(dim_y, dim_z));
+	size_t count = 1;
+	while (max_dim > 1)
+	{
+		max_dim >>= 1;
+		count++;
+	}
+
+	return count;
+}
+
+/**
+ * @brief Get the dimensions of a mipmap level, by halving the base level dimensions.
+ *
+ * @param dim_x    The base level width in texels.
+ * @param dim_y    The base level height in texels.
+ * @param dim_z    The base level depth in texels.
+ * @param level    The mipmap level to query.
+ * @param[out] level_x   The level width in texels.
+ * @param[out] level_y   The level height in texels.
+ * @param[out] level_z   The level depth in texels.
+ */
+static void get_mip_level_dims(
+	size_t dim_x,
+	size_t dim_y,
+	size_t dim_z,
+	size_t level,
+	size_t& level_x,
+	size_t& level_y,
+	size_t& level_z
+) {
+	level_x = astc::max<size_t>(dim_x >> level, 1);
+	level_y = astc::max<size_t>(dim_y >> level, 1);
+	level_z = astc::max<size_t>(dim_z >> level, 1);
+}
+
+/**
  * @brief Load an uncompressed KTX image using the local custom loader.
  *
  * @param      filename          The name of the file to load.
@@ -974,12 +1024,32 @@ static astcenc_image_ptr load_ktx_uncompressed_image(
 	bool y_flip,
 	bool& is_hdr,
 	unsigned int& component_count
+);
+
+/**
+ * @brief Load an uncompressed KTX image, including all mipmap levels.
+ *
+ * @param      filename          The name of the file to load.
+ * @param      y_flip            Should the image be vertically flipped?
+ * @param[out] is_hdr            Is this an HDR image load?
+ * @param[out] component_count   The number of components in the data.
+ *
+ * @return The loaded level data in a canonical 4 channel format, with the base level first. The
+ *         vector is empty on error.
+ */
+static std::vector<astcenc_image_ptr> load_ktx_uncompressed_image_mips(
+	const char* filename,
+	bool y_flip,
+	bool& is_hdr,
+	unsigned int& component_count
 ) {
+	std::vector<astcenc_image_ptr> levels;
+
 	std::ifstream file(filename, std::ios::in | std::ios::binary);
 	if (!file)
 	{
 		print_error("ERROR: File open failed '%s'\n", filename);
-		return nullptr;
+		return levels;
 	}
 
 	ktx_header hdr;
@@ -987,13 +1057,13 @@ static astcenc_image_ptr load_ktx_uncompressed_image(
 	if (file.fail())
 	{
 		print_error("ERROR: File read failed '%s'\n", filename);
-		return nullptr;
+		return levels;
 	}
 
 	if (memcmp(hdr.magic, ktx_magic, 12) != 0 || (hdr.endianness != 0x04030201 && hdr.endianness != 0x01020304))
 	{
 		print_error("ERROR: Image header corrupt '%s'\n", filename);
-		return nullptr;
+		return levels;
 	}
 
 	bool switch_endianness = false;
@@ -1006,7 +1076,7 @@ static astcenc_image_ptr load_ktx_uncompressed_image(
 	if (hdr.gl_type == 0 || hdr.gl_format == 0)
 	{
 		print_error("ERROR: Image uses unsupported KTX format '%s'\n", filename);
-		return nullptr;
+		return levels;
 	}
 
 	// Supported formats are all pairings of:
@@ -1042,7 +1112,7 @@ static astcenc_image_ptr load_ktx_uncompressed_image(
 		break;
 	default:
 		print_error("ERROR: Image uses unsupported KTX format '%s'\n", filename);
-		return nullptr;
+		return levels;
 	}
 
 	// Although these are set up later, use default initializer to remove warnings
@@ -1186,12 +1256,7 @@ static astcenc_image_ptr load_ktx_uncompressed_image(
 		}
 	default:
 		print_error("ERROR: Image uses unsupported KTX format '%s'\n", filename);
-		return nullptr;
-	}
-
-	if (hdr.number_of_mipmap_levels > 1)
-	{
-		printf("WARNING: Only the first of %u mipmap levels will be compressed '%s'.\n", hdr.number_of_mipmap_levels, filename);
+		return levels;
 	}
 
 	if (hdr.number_of_array_elements > 1)
@@ -1208,141 +1273,265 @@ static astcenc_image_ptr load_ktx_uncompressed_image(
 	size_t dim_y = astc::max(hdr.pixel_height, 1u);
 	size_t dim_z = astc::max(hdr.pixel_depth, 1u);
 
+	// A KTX1 count of zero means "generate on load"; we can only retain the stored base level
+	size_t level_count = astc::max<size_t>(hdr.number_of_mipmap_levels, 1);
+
+	// Reject chains which cannot exist for the image dimensions; each stored level must halve the
+	// previous level dimensions until one texel is reached
+	size_t max_levels = get_mip_level_count(dim_x, dim_y, dim_z);
+	if (level_count > max_levels)
+	{
+		print_error("ERROR: KTX mipmap level count %zu exceeds maximum %zu for image '%s'\n",
+		            level_count, max_levels, filename);
+		return levels;
+	}
+
 	// Ignore the key/value data
 	file.seekg(hdr.bytes_of_key_value_data, std::ios::cur);
 	if (file.fail())
 	{
 		print_error("ERROR: File read failed '%s'\n", filename);
-		return nullptr;
+		return levels;
 	}
 
-	uint32_t specified_bytes_per_image = 0;
-	file.read(reinterpret_cast<char*>(&specified_bytes_per_image), sizeof(specified_bytes_per_image));
-	if (file.fail())
-	{
-		print_error("ERROR: File read failed '%s'\n", filename);
-		return nullptr;
-	}
-
-	if (switch_endianness)
-	{
-		specified_bytes_per_image = reverse_bytes_u32(specified_bytes_per_image);
-	}
-
-	// Compute surface size, checking for overflow caused by bad user-defined sizes
-	// These values are trusted and cannot overflow
+	// Compute the payload size for a single level, checking for overflow caused by bad
+	// user-defined sizes. These values are trusted and cannot overflow.
 	size_t bytes_per_pixel = bytes_per_component * components;
 
-	bool overflow { false };
+	auto get_level_bytes = [&](size_t level_x, size_t level_y, size_t level_z,
+	                           size_t& bytes_per_image, size_t& bytes_per_mip) {
+		bool overflow { false };
 
-	size_t bytes_per_row = astc::mul_safe(bytes_per_pixel, dim_x, overflow);
+		size_t bytes_per_row = astc::mul_safe(bytes_per_pixel, level_x, overflow);
 
-	// KTX rows must be padded to four bytes, including the final row
-	size_t padded_row = (bytes_per_row + 3) & ~static_cast<size_t>(3);
-	overflow = overflow || (padded_row < bytes_per_row);
-	bytes_per_row = padded_row;
+		// KTX rows must be padded to four bytes, including the final row
+		size_t padded_row = (bytes_per_row + 3) & ~static_cast<size_t>(3);
+		overflow = overflow || (padded_row < bytes_per_row);
+		bytes_per_row = padded_row;
 
-	size_t bytes_per_plane = astc::mul_safe(bytes_per_row, dim_y, overflow);
-	size_t bytes_per_image = astc::mul_safe(bytes_per_plane, dim_z, overflow);
+		size_t bytes_per_plane = astc::mul_safe(bytes_per_row, level_y, overflow);
+		bytes_per_image = astc::mul_safe(bytes_per_plane, level_z, overflow);
 
-	// KTX imageSize includes all array layers and faces, except for non-array cubemaps
-	size_t bytes_per_mip = bytes_per_image;
-	if (hdr.number_of_array_elements > 0)
+		// KTX imageSize includes all array layers and faces, except for non-array cubemaps
+		bytes_per_mip = bytes_per_image;
+		if (hdr.number_of_array_elements > 0)
+		{
+			bytes_per_mip = astc::mul_safe(bytes_per_mip, hdr.number_of_array_elements, overflow);
+			bytes_per_mip = astc::mul_safe(bytes_per_mip, hdr.number_of_faces, overflow);
+		}
+
+		// Also verify that our output plane allocation does not overflow because this always uses
+		// 4 components which can be more than the input file used
+		size_t plane_texels = astc::mul_safe(level_x, level_y, overflow);
+		astc::mul_safe(plane_texels, 4, overflow);
+
+		return overflow;
+	};
+
+	// Read, validate and convert each mipmap level in turn
+	for (size_t level = 0; level < level_count; level++)
 	{
-		bytes_per_mip = astc::mul_safe(bytes_per_mip, hdr.number_of_array_elements, overflow);
-		bytes_per_mip = astc::mul_safe(bytes_per_mip, hdr.number_of_faces, overflow);
+		size_t level_x;
+		size_t level_y;
+		size_t level_z;
+		get_mip_level_dims(dim_x, dim_y, dim_z, level, level_x, level_y, level_z);
+
+		uint32_t specified_bytes_per_image = 0;
+		file.read(reinterpret_cast<char*>(&specified_bytes_per_image), sizeof(specified_bytes_per_image));
+		if (file.fail())
+		{
+			print_error("ERROR: KTX mipmap chain is truncated at level %zu '%s'\n", level, filename);
+			levels.clear();
+			return levels;
+		}
+
+		if (switch_endianness)
+		{
+			specified_bytes_per_image = reverse_bytes_u32(specified_bytes_per_image);
+		}
+
+		size_t bytes_per_image = 0;
+		size_t bytes_per_mip = 0;
+		bool overflow = get_level_bytes(level_x, level_y, level_z, bytes_per_image, bytes_per_mip);
+
+		if (overflow || (bytes_per_mip != specified_bytes_per_image))
+		{
+			// The declared size does not describe the dimensions implied by the level index; the
+			// most likely cause is a corrupt or non-mipmap-aware writer
+			print_error("ERROR: KTX mipmap level %zu image size %u does not match expected %zu "
+			            "for %zux%zux%zu '%s'\n",
+			            level, specified_bytes_per_image, bytes_per_mip,
+			            level_x, level_y, level_z, filename);
+			levels.clear();
+			return levels;
+		}
+
+		std::unique_ptr<uint8_t[]> buf;
+		try
+		{
+			buf = std::make_unique<uint8_t[]>(bytes_per_image);
+		}
+		catch (const std::bad_alloc &e)
+		{
+			ASTCENC_UNUSED(e);
+			print_error("ERROR: Image memory allocation failed '%s'\n", filename);
+			levels.clear();
+			return levels;
+		}
+
+		file.read(reinterpret_cast<char*>(buf.get()), bytes_per_image);
+		if (file.fail())
+		{
+			print_error("ERROR: KTX mipmap chain is truncated at level %zu '%s'\n", level, filename);
+			levels.clear();
+			return levels;
+		}
+
+		// Skip any further array layers or faces in this level, which we do not retain
+		if (bytes_per_mip > bytes_per_image)
+		{
+			file.seekg(static_cast<std::streamoff>(bytes_per_mip - bytes_per_image), std::ios::cur);
+			if (file.fail())
+			{
+				print_error("ERROR: KTX mipmap chain is truncated at level %zu '%s'\n", level, filename);
+				levels.clear();
+				return levels;
+			}
+		}
+
+		// Perform an endianness swap on the surface if needed
+		if (switch_endianness)
+		{
+			if (hdr.gl_type_size == 2)
+			{
+				switch_endianness2(buf.get(), bytes_per_image);
+			}
+
+			if (hdr.gl_type_size == 4)
+			{
+				switch_endianness4(buf.get(), bytes_per_image);
+			}
+		}
+
+		// Transfer data from the surface to our own image data structure
+		astcenc_image_ptr astc_img;
+		try
+		{
+			astc_img = alloc_image(bitness, level_x, level_y, level_z);
+		}
+		catch (const std::bad_alloc &e)
+		{
+			ASTCENC_UNUSED(e);
+			print_error("ERROR: Image memory allocation failed '%s'\n", filename);
+			levels.clear();
+			return levels;
+		}
+
+		if (!astc_img)
+		{
+			print_error("ERROR: Image memory size overflow\n");
+			levels.clear();
+			return levels;
+		}
+
+		size_t padded_row = (bytes_per_pixel * level_x + 3) & ~static_cast<size_t>(3);
+		size_t bytes_per_plane = padded_row * level_y;
+
+		for (size_t z = 0; z < level_z; z++)
+		{
+			for (size_t y = 0; y < level_y; y++)
+			{
+				size_t mod_y = y_flip ? level_y - y - 1 : y;
+				void *dst;
+
+				if (astc_img->data_type == ASTCENC_TYPE_U8)
+				{
+					uint8_t* data8 = static_cast<uint8_t*>(astc_img->data[z]);
+					dst = static_cast<void*>(&data8[4 * level_x * mod_y]);
+				}
+				else  // if (astc_img->data_type == ASTCENC_TYPE_F16)
+				{
+					assert(astc_img->data_type == ASTCENC_TYPE_F16);
+					uint16_t* data16 = static_cast<uint16_t*>(astc_img->data[z]);
+					dst = static_cast<void*>(&data16[4 * level_x * mod_y]);
+				}
+
+				uint8_t *src = buf.get() + (z * bytes_per_plane) + (y * padded_row);
+				copy_scanline(dst, src, level_x, copy_method);
+			}
+		}
+
+		levels.push_back(std::move(astc_img));
 	}
 
-	// Also verify that our output plane allocation does not overflow because this always uses 4
-	// components which can be more than the input file used
-	size_t plane_texels = astc::mul_safe(dim_x, dim_y, overflow);
-	astc::mul_safe(plane_texels, 4, overflow);
+	// Trailing data after the declared level count means the level count is stale. Ignore small
+	// padding amounts, but reject any remainder large enough to hold one more full level.
+	std::streampos current = file.tellg();
+	file.seekg(0, std::ios::end);
+	std::streampos file_end = file.tellg();
+	file.seekg(current, std::ios::beg);
 
-	if (overflow || (bytes_per_mip != specified_bytes_per_image))
-	{
-		print_error("ERROR: Image header corrupt '%s'\n", filename);
-		return nullptr;
-	}
-
-	std::unique_ptr<uint8_t[]> buf;
-	try
-	{
-		buf = std::make_unique<uint8_t[]>(bytes_per_image);
-	}
-	catch (const std::bad_alloc &e)
-	{
-		ASTCENC_UNUSED(e);
-		print_error("ERROR: Image memory allocation failed '%s'\n", filename);
-		return nullptr;
-	}
-
-	file.read(reinterpret_cast<char*>(buf.get()), bytes_per_image);
 	if (file.fail())
 	{
 		print_error("ERROR: File read failed '%s'\n", filename);
-		return nullptr;
+		levels.clear();
+		return levels;
 	}
 
-	// Perform an endianness swap on the surface if needed
-	if (switch_endianness)
+	if (file_end > current && level_count < max_levels)
 	{
-		if (hdr.gl_type_size == 2)
+		size_t level_x;
+		size_t level_y;
+		size_t level_z;
+		get_mip_level_dims(dim_x, dim_y, dim_z, level_count, level_x, level_y, level_z);
+
+		size_t next_bytes_per_image = 0;
+		size_t next_bytes_per_mip = 0;
+		bool next_overflow = get_level_bytes(level_x, level_y, level_z,
+		                                     next_bytes_per_image, next_bytes_per_mip);
+
+		size_t trailing = static_cast<size_t>(file_end - current);
+		if (!next_overflow && (trailing >= (next_bytes_per_mip + sizeof(uint32_t))))
 		{
-			switch_endianness2(buf.get(), bytes_per_image);
-		}
-
-		if (hdr.gl_type_size == 4)
-		{
-			switch_endianness4(buf.get(), bytes_per_image);
-		}
-	}
-
-	// Transfer data from the surface to our own image data structure
-	astcenc_image_ptr astc_img;
-	try
-	{
-		astc_img = alloc_image(bitness, dim_x, dim_y, dim_z);
-	}
-	catch (const std::bad_alloc &e)
-	{
-		ASTCENC_UNUSED(e);
-		print_error("ERROR: Image memory allocation failed '%s'\n", filename);
-		return nullptr;
-	}
-
-	if (!astc_img)
-	{
-		print_error("ERROR: Image memory size overflow\n");
-		return nullptr;
-	}
-
-	for (size_t z = 0; z < dim_z; z++)
-	{
-		for (size_t y = 0; y < dim_y; y++)
-		{
-			size_t mod_y = y_flip ? dim_y - y - 1 : y;
-			void *dst;
-
-			if (astc_img->data_type == ASTCENC_TYPE_U8)
-			{
-				uint8_t* data8 = static_cast<uint8_t*>(astc_img->data[z]);
-				dst = static_cast<void*>(&data8[4 * dim_x * mod_y]);
-			}
-			else  // if (astc_img->data_type == ASTCENC_TYPE_F16)
-			{
-				assert(astc_img->data_type == ASTCENC_TYPE_F16);
-				uint16_t* data16 = static_cast<uint16_t*>(astc_img->data[z]);
-				dst = static_cast<void*>(&data16[4 * dim_x * mod_y]);
-			}
-
-			uint8_t *src = buf.get() + (z * bytes_per_plane) + (y * bytes_per_row);
-			copy_scanline(dst, src, dim_x, copy_method);
+			print_error("ERROR: KTX mipmap level count %zu is inconsistent with file data '%s'\n",
+			            level_count, filename);
+			levels.clear();
+			return levels;
 		}
 	}
 
 	is_hdr = bitness >= 16;
 	component_count = components;
-	return astc_img;
+	return levels;
+}
+
+/**
+ * @brief Load an uncompressed KTX image using the local custom loader.
+ *
+ * Only the base level of a mipmap chain is returned. Use the mips loader to read the full chain.
+ *
+ * @param      filename          The name of the file to load.
+ * @param      y_flip            Should the image be vertically flipped?
+ * @param[out] is_hdr            Is this an HDR image load?
+ * @param[out] component_count   The number of components in the data.
+ *
+ * @return The loaded image data in a canonical 4 channel format, or @c nullptr on error.
+ */
+static astcenc_image_ptr load_ktx_uncompressed_image(
+	const char* filename,
+	bool y_flip,
+	bool& is_hdr,
+	unsigned int& component_count
+) {
+	std::vector<astcenc_image_ptr> levels = load_ktx_uncompressed_image_mips(
+	    filename, y_flip, is_hdr, component_count);
+
+	if (levels.empty())
+	{
+		return nullptr;
+	}
+
+	return std::move(levels[0]);
 }
 
 /**
@@ -1410,59 +1599,138 @@ bool load_ktx_compressed_image(
 		return true;
 	}
 
-	// Read the length of the data and convert endianness
-	uint32_t data_len;
-	file.read(reinterpret_cast<char*>(&data_len), sizeof(data_len));
-	if (file.fail())
-	{
-		print_error("ERROR: File read failed '%s'\n", filename);
-		return true;
-	}
-
-	if (switch_endianness)
-	{
-		data_len = reverse_bytes_u32(data_len);
-	}
-
-	// The data size and pixel dimensions are independent header fields, so reject a data size that
-	// is too small for the given image dimensions
 	size_t block_x = fmt->x;
 	size_t block_y = fmt->y;
 	size_t block_z = fmt->z == 0 ? 1 : fmt->z;
 
+	size_t dim_x = hdr.pixel_width;
+	size_t dim_y = hdr.pixel_height;
 	size_t dim_z = hdr.pixel_depth == 0 ? 1 : hdr.pixel_depth;
-	size_t blocks_x =  astc::get_block_count_safe(hdr.pixel_width, block_x);
-	size_t blocks_y = astc::get_block_count_safe(hdr.pixel_height, block_y);
-	size_t blocks_z = astc::get_block_count_safe(dim_z, block_z);
 
-	bool overflow { false };
-	size_t size_needed = astc::mul_safe(blocks_x, blocks_y, overflow);
-	size_needed = astc::mul_safe(size_needed, blocks_z, overflow);
-	size_needed = astc::mul_safe(size_needed, 16, overflow);
+	// A KTX1 count of zero means "generate on load"; we can only retain the stored base level
+	size_t level_count = astc::max<size_t>(hdr.number_of_mipmap_levels, 1);
 
-	if (overflow || data_len < size_needed)
+	// Reject chains which cannot exist for the image dimensions
+	size_t max_levels = get_mip_level_count(dim_x, dim_y, dim_z);
+	if (level_count > max_levels)
 	{
-		print_error("ERROR: Image header corrupt '%s'\n", filename);
+		print_error("ERROR: KTX mipmap level count %zu exceeds maximum %zu for image '%s'\n",
+		            level_count, max_levels, filename);
 		return true;
 	}
 
-	// Read the data
-	img.data.resize(data_len);
-	file.read(reinterpret_cast<char*>(img.data.data()), data_len);
+	img.levels.clear();
+	img.levels.reserve(level_count);
+
+	for (size_t level = 0; level < level_count; level++)
+	{
+		size_t level_x;
+		size_t level_y;
+		size_t level_z;
+		get_mip_level_dims(dim_x, dim_y, dim_z, level, level_x, level_y, level_z);
+
+		// Read the length of the data and convert endianness
+		uint32_t data_len;
+		file.read(reinterpret_cast<char*>(&data_len), sizeof(data_len));
+		if (file.fail())
+		{
+			print_error("ERROR: KTX mipmap chain is truncated at level %zu '%s'\n",
+			            level, filename);
+			img.levels.clear();
+			return true;
+		}
+
+		if (switch_endianness)
+		{
+			data_len = reverse_bytes_u32(data_len);
+		}
+
+		// The data size and pixel dimensions are independent header fields, so reject a data size
+		// that does not describe a block-aligned level of the expected dimensions
+		size_t blocks_x = astc::get_block_count_safe(level_x, block_x);
+		size_t blocks_y = astc::get_block_count_safe(level_y, block_y);
+		size_t blocks_z = astc::get_block_count_safe(level_z, block_z);
+
+		bool overflow { false };
+		size_t size_needed = astc::mul_safe(blocks_x, blocks_y, overflow);
+		size_needed = astc::mul_safe(size_needed, blocks_z, overflow);
+		size_needed = astc::mul_safe(size_needed, 16, overflow);
+
+		if (overflow || data_len != size_needed)
+		{
+			print_error("ERROR: KTX mipmap level %zu image size %u does not match expected %zu "
+			            "for %zux%zux%zu '%s'\n",
+			            level, data_len, size_needed, level_x, level_y, level_z, filename);
+			img.levels.clear();
+			return true;
+		}
+
+		astc_compressed_level level_data;
+		level_data.dim_x = level_x;
+		level_data.dim_y = level_y;
+		level_data.dim_z = level_z;
+
+		// Read the data
+		level_data.data.resize(data_len);
+		file.read(reinterpret_cast<char*>(level_data.data.data()), data_len);
+		if (file.fail())
+		{
+			print_error("ERROR: KTX mipmap chain is truncated at level %zu '%s'\n",
+			            level, filename);
+			img.levels.clear();
+			return true;
+		}
+
+		img.levels.push_back(std::move(level_data));
+	}
+
+	// Trailing data after the declared level count means the level count is stale. Ignore small
+	// padding amounts, but reject any remainder large enough to hold one more full level.
+	std::streampos current = file.tellg();
+	file.seekg(0, std::ios::end);
+	std::streampos file_end = file.tellg();
+	file.seekg(current, std::ios::beg);
+
 	if (file.fail())
 	{
 		print_error("ERROR: File read failed '%s'\n", filename);
-		img.data.clear();
+		img.levels.clear();
 		return true;
+	}
+
+	if (file_end > current && level_count < max_levels)
+	{
+		size_t level_x;
+		size_t level_y;
+		size_t level_z;
+		get_mip_level_dims(dim_x, dim_y, dim_z, level_count, level_x, level_y, level_z);
+
+		size_t blocks_x = astc::get_block_count_safe(level_x, block_x);
+		size_t blocks_y = astc::get_block_count_safe(level_y, block_y);
+		size_t blocks_z = astc::get_block_count_safe(level_z, block_z);
+
+		bool next_overflow { false };
+		size_t next_bytes_per_mip = astc::mul_safe(blocks_x, blocks_y, next_overflow);
+		next_bytes_per_mip = astc::mul_safe(next_bytes_per_mip, blocks_z, next_overflow);
+		next_bytes_per_mip = astc::mul_safe(next_bytes_per_mip, 16, next_overflow);
+
+		size_t trailing = static_cast<size_t>(file_end - current);
+		if (next_overflow || (trailing >= (next_bytes_per_mip + sizeof(uint32_t))))
+		{
+			print_error("ERROR: KTX mipmap level count %zu is inconsistent with file data '%s'\n",
+			            level_count, filename);
+			img.levels.clear();
+			return true;
+		}
 	}
 
 	img.block_x = fmt->x;
 	img.block_y = fmt->y;
 	img.block_z = fmt->z == 0 ? 1 : fmt->z;
 
-	img.dim_x = hdr.pixel_width;
-	img.dim_y = hdr.pixel_height;
-	img.dim_z = hdr.pixel_depth == 0 ? 1 : hdr.pixel_depth;
+	img.dim_x = dim_x;
+	img.dim_y = dim_y;
+	img.dim_z = dim_z;
 
 	is_srgb = fmt->is_srgb;
 
@@ -1484,7 +1752,7 @@ bool store_ktx_compressed_image(
 	bool is_srgb
 ) {
 	if ((img.dim_x > max_u32) || (img.dim_y > max_u32) || (img.dim_z > max_u32) ||
-	    (img.data.size() > max_u32))
+	    (img.levels.size() > max_u32))
 	{
 		print_error("ERROR: Image exceeds file format size limits\n");
 		return true;
@@ -1493,7 +1761,6 @@ bool store_ktx_compressed_image(
 	uint32_t dim_x = static_cast<uint32_t>(img.dim_x);
 	uint32_t dim_y = static_cast<uint32_t>(img.dim_y);
 	uint32_t dim_z = static_cast<uint32_t>(img.dim_z);
-	uint32_t data_len = static_cast<uint32_t>(img.data.size());
 
 	unsigned int fmt = get_format(img.block_x, img.block_y, img.block_z, is_srgb);
 
@@ -1510,7 +1777,7 @@ bool store_ktx_compressed_image(
 	hdr.pixel_depth = (dim_z == 1) ? 0 : dim_z;
 	hdr.number_of_array_elements = 0;
 	hdr.number_of_faces = 1;
-	hdr.number_of_mipmap_levels = 1;
+	hdr.number_of_mipmap_levels = static_cast<uint32_t>(img.levels.size());
 	hdr.bytes_of_key_value_data = 0;
 
 #if defined(ASTCENC_BIG_ENDIAN)
@@ -1523,13 +1790,30 @@ bool store_ktx_compressed_image(
 		return true;
 	}
 
+	file.write(reinterpret_cast<const char*>(&hdr), sizeof(ktx_header));
+
+	for (const astc_compressed_level& level : img.levels)
+	{
+		if (level.data.size() > max_u32)
+		{
+			print_error("ERROR: Image exceeds file format size limits\n");
+			return true;
+		}
+
+		uint32_t data_len = static_cast<uint32_t>(level.data.size());
+
 #if defined(ASTCENC_BIG_ENDIAN)
-	data_len = reverse_bytes_u32(data_len);
+		data_len = reverse_bytes_u32(data_len);
 #endif
 
-	file.write(reinterpret_cast<const char*>(&hdr), sizeof(ktx_header));
-	file.write(reinterpret_cast<const char*>(&data_len), sizeof(uint32_t));
-	file.write(reinterpret_cast<const char*>(img.data.data()), img.data.size());
+		file.write(reinterpret_cast<const char*>(&data_len), sizeof(uint32_t));
+		file.write(reinterpret_cast<const char*>(level.data.data()), level.data.size());
+		if (file.fail())
+		{
+			return true;
+		}
+	}
+
 	file.close();
 	return file.fail();
 }
@@ -1537,18 +1821,21 @@ bool store_ktx_compressed_image(
 /**
  * @brief Save a KTX uncompressed image using a local store routine.
  *
- * @param img        The source data for the image.
+ * @param levels     The source data for the image, with the base level first.
  * @param filename   The name of the file to save.
  * @param y_flip     Should the image be vertically flipped?
  *
  * @return @c true on error, @c false on success.
  */
-static bool store_ktx_uncompressed_image(
-	const astcenc_image* img,
+static bool store_ktx_uncompressed_image_mips(
+	const std::vector<const astcenc_image*>& levels,
 	const char* filename,
 	int y_flip
 ) {
-	if ((img->dim_x > max_u32) || (img->dim_y > max_u32) || (img->dim_z > max_u32))
+	const astcenc_image* img = levels[0];
+
+	if ((img->dim_x > max_u32) || (img->dim_y > max_u32) || (img->dim_z > max_u32) ||
+	    (levels.size() > max_u32))
 	{
 		print_error("ERROR: Image exceeds file format size limits\n");
 		return true;
@@ -1558,10 +1845,6 @@ static bool store_ktx_uncompressed_image(
 	uint32_t dim_y_field = static_cast<uint32_t>(img->dim_y);
 	uint32_t dim_z_field = static_cast<uint32_t>(img->dim_z);
 
-	size_t dim_x = img->dim_x;
-	size_t dim_y = img->dim_y;
-	size_t dim_z = img->dim_z;
-
 	unsigned int bitness = img->data_type == ASTCENC_TYPE_U8 ? 8 : 16;
 	unsigned int image_components = determine_image_components(img);
 
@@ -1570,27 +1853,6 @@ static bool store_ktx_uncompressed_image(
 	{
 		image_components += 2;
 	}
-
-	// KTX rows must be padded to four bytes, including the final row
-	bool overflow { false };
-	size_t row_bytes = astc::mul_safe(dim_x, image_components * (bitness / 8), overflow);
-	size_t padded_row = (row_bytes + 3) & ~static_cast<size_t>(3);
-	overflow = overflow || (padded_row < row_bytes);
-	row_bytes = padded_row;
-
-	size_t plane_bytes = astc::mul_safe(row_bytes, dim_y, overflow);
-
-	size_t image_bytes = astc::mul_safe(plane_bytes, dim_z, overflow);
-
-	// The padded image size must fit the KTX 32-bit size field
-	if (overflow || (image_bytes > max_u32))
-	{
-		return true;
-	}
-
-	uint32_t image_bytes_field = static_cast<uint32_t>(image_bytes);
-
-	ktx_header hdr;
 
 	static const int gl_format_of_components[4] {
 		GL_RED, GL_RG, GL_RGB, GL_RGBA
@@ -1603,6 +1865,8 @@ static bool store_ktx_uncompressed_image(
 	static const int gl_sized_format_of_components_hdr[4] {
 		GL_R16F, GL_RG16F, GL_RGB16F, GL_RGBA16F
 	};
+
+	ktx_header hdr;
 
 	memcpy(hdr.magic, ktx_magic, 12);
 	hdr.endianness = 0x04030201;
@@ -1625,148 +1889,197 @@ static bool store_ktx_uncompressed_image(
 	hdr.pixel_depth = (dim_z_field == 1) ? 0 : dim_z_field;
 	hdr.number_of_array_elements = 0;
 	hdr.number_of_faces = 1;
-	hdr.number_of_mipmap_levels = 1;
+	hdr.number_of_mipmap_levels = static_cast<uint32_t>(levels.size());
 	hdr.bytes_of_key_value_data = 0;
-
-	// Collect image data to write
-	std::vector<uint8_t> pixel_data8;
-	std::vector<uint16_t> pixel_data16;
-
-	if (bitness == 8)
-	{
-		pixel_data8.resize(image_bytes);
-
-		for (size_t z = 0; z < dim_z; z++)
-		{
-			uint8_t* data8 = static_cast<uint8_t*>(img->data[z]);
-
-			for (size_t y = 0; y < dim_y; y++)
-			{
-				size_t mod_y = y;
-				if (y_flip)
-				{
-					mod_y = dim_y - y - 1;
-				}
-
-				uint8_t* src_row = data8 + 4 * dim_x * mod_y;
-				uint8_t* dest_row = &pixel_data8[z * plane_bytes + y * row_bytes];
-
-				switch (image_components)
-				{
-				case 1:  // One component, treated as Luminance
-					for (size_t x = 0; x < dim_x; x++)
-					{
-						dest_row[x] = src_row[4 * x    ];
-					}
-					break;
-				case 2:  // Two component, treated as Luminance-Alpha
-					for (size_t x = 0; x < dim_x; x++)
-					{
-						dest_row[2 * x    ] = src_row[4 * x    ];
-						dest_row[2 * x + 1] = src_row[4 * x + 3];
-					}
-					break;
-				case 3:  // Three component, treated as RGB
-					for (size_t x = 0; x < dim_x; x++)
-					{
-						dest_row[3 * x    ] = src_row[4 * x    ];
-						dest_row[3 * x + 1] = src_row[4 * x + 1];
-						dest_row[3 * x + 2] = src_row[4 * x + 2];
-					}
-					break;
-				case 4:  // Four component, treated as RGBA
-					for (size_t x = 0; x < dim_x; x++)
-					{
-						dest_row[4 * x    ] = src_row[4 * x    ];
-						dest_row[4 * x + 1] = src_row[4 * x + 1];
-						dest_row[4 * x + 2] = src_row[4 * x + 2];
-						dest_row[4 * x + 3] = src_row[4 * x + 3];
-					}
-					break;
-				}
-			}
-		}
-	}
-	else  // If bitness == 16
-	{
-		pixel_data16.resize(image_bytes / sizeof(uint16_t));
-
-		for (size_t z = 0; z < dim_z; z++)
-		{
-			uint16_t* data16 = static_cast<uint16_t*>(img->data[z]);
-
-			for (size_t y = 0; y < dim_y; y++)
-			{
-				size_t mod_y = y;
-				if (y_flip)
-				{
-					mod_y = dim_y - y - 1;
-				}
-
-				uint16_t* src_row = data16 + 4 * dim_x * mod_y;
-				uint16_t* dest_row = &pixel_data16[(z * plane_bytes + y * row_bytes) / sizeof(uint16_t)];
-
-				switch (image_components)
-				{
-				case 1:  // One component, treated as Luminance
-					for (size_t x = 0; x < dim_x; x++)
-					{
-						dest_row[x] = src_row[4 * x    ];
-					}
-					break;
-				case 2:  // Two component, treated as Luminance-Alpha
-					for (size_t x = 0; x < dim_x; x++)
-					{
-						dest_row[2 * x    ] = src_row[4 * x    ];
-						dest_row[2 * x + 1] = src_row[4 * x + 3];
-					}
-					break;
-				case 3:  // Three component, treated as RGB
-					for (size_t x = 0; x < dim_x; x++)
-					{
-						dest_row[3 * x    ] = src_row[4 * x    ];
-						dest_row[3 * x + 1] = src_row[4 * x + 1];
-						dest_row[3 * x + 2] = src_row[4 * x + 2];
-					}
-					break;
-				case 4:  // Four component, treated as RGBA
-					for (size_t x = 0; x < dim_x; x++)
-					{
-						dest_row[4 * x    ] = src_row[4 * x    ];
-						dest_row[4 * x + 1] = src_row[4 * x + 1];
-						dest_row[4 * x + 2] = src_row[4 * x + 2];
-						dest_row[4 * x + 3] = src_row[4 * x + 3];
-					}
-					break;
-				}
-			}
-		}
-	}
 
 	bool error { false };
 	std::ofstream file(filename, std::ios::out | std::ios::binary);
-	if (file)
+	if (!file)
 	{
+		return true;
+	}
+
+	file.write(reinterpret_cast<const char*>(&hdr), sizeof(ktx_header));
+
+	for (const astcenc_image* level_img : levels)
+	{
+		if (level_img->data_type != img->data_type)
+		{
+			print_error("ERROR: Mipmap levels use different data types\n");
+			return true;
+		}
+
+		size_t dim_x = level_img->dim_x;
+		size_t dim_y = level_img->dim_y;
+		size_t dim_z = level_img->dim_z;
+
+		// KTX rows must be padded to four bytes, including the final row
+		bool overflow { false };
+		size_t row_bytes = astc::mul_safe(dim_x, image_components * (bitness / 8), overflow);
+		size_t padded_row = (row_bytes + 3) & ~static_cast<size_t>(3);
+		overflow = overflow || (padded_row < row_bytes);
+		row_bytes = padded_row;
+
+		size_t plane_bytes = astc::mul_safe(row_bytes, dim_y, overflow);
+		size_t image_bytes = astc::mul_safe(plane_bytes, dim_z, overflow);
+
+		// The padded image size must fit the KTX 32-bit size field
+		if (overflow || (image_bytes > max_u32))
+		{
+			return true;
+		}
+
+		uint32_t image_bytes_field = static_cast<uint32_t>(image_bytes);
+
+		// Collect image data to write
+		std::vector<uint8_t> pixel_data8;
+		std::vector<uint16_t> pixel_data16;
+
+		if (bitness == 8)
+		{
+			pixel_data8.resize(image_bytes);
+
+			for (size_t z = 0; z < dim_z; z++)
+			{
+				uint8_t* data8 = static_cast<uint8_t*>(level_img->data[z]);
+
+				for (size_t y = 0; y < dim_y; y++)
+				{
+					size_t mod_y = y;
+					if (y_flip)
+					{
+						mod_y = dim_y - y - 1;
+					}
+
+					uint8_t* src_row = data8 + 4 * dim_x * mod_y;
+					uint8_t* dest_row = &pixel_data8[z * plane_bytes + y * row_bytes];
+
+					switch (image_components)
+					{
+					case 1:  // One component, treated as Luminance
+						for (size_t x = 0; x < dim_x; x++)
+						{
+							dest_row[x] = src_row[4 * x    ];
+						}
+						break;
+					case 2:  // Two component, treated as Luminance-Alpha
+						for (size_t x = 0; x < dim_x; x++)
+						{
+							dest_row[2 * x    ] = src_row[4 * x    ];
+							dest_row[2 * x + 1] = src_row[4 * x + 3];
+						}
+						break;
+					case 3:  // Three component, treated as RGB
+						for (size_t x = 0; x < dim_x; x++)
+						{
+							dest_row[3 * x    ] = src_row[4 * x    ];
+							dest_row[3 * x + 1] = src_row[4 * x + 1];
+							dest_row[3 * x + 2] = src_row[4 * x + 2];
+						}
+						break;
+					case 4:  // Four component, treated as RGBA
+						for (size_t x = 0; x < dim_x; x++)
+						{
+							dest_row[4 * x    ] = src_row[4 * x    ];
+							dest_row[4 * x + 1] = src_row[4 * x + 1];
+							dest_row[4 * x + 2] = src_row[4 * x + 2];
+							dest_row[4 * x + 3] = src_row[4 * x + 3];
+						}
+						break;
+					}
+				}
+			}
+		}
+		else  // If bitness == 16
+		{
+			pixel_data16.resize(image_bytes / sizeof(uint16_t));
+
+			for (size_t z = 0; z < dim_z; z++)
+			{
+				uint16_t* data16 = static_cast<uint16_t*>(level_img->data[z]);
+
+				for (size_t y = 0; y < dim_y; y++)
+				{
+					size_t mod_y = y;
+					if (y_flip)
+					{
+						mod_y = dim_y - y - 1;
+					}
+
+					uint16_t* src_row = data16 + 4 * dim_x * mod_y;
+					uint16_t* dest_row = &pixel_data16[(z * plane_bytes + y * row_bytes) / sizeof(uint16_t)];
+
+					switch (image_components)
+					{
+					case 1:  // One component, treated as Luminance
+						for (size_t x = 0; x < dim_x; x++)
+						{
+							dest_row[x] = src_row[4 * x    ];
+						}
+						break;
+					case 2:  // Two component, treated as Luminance-Alpha
+						for (size_t x = 0; x < dim_x; x++)
+						{
+							dest_row[2 * x    ] = src_row[4 * x    ];
+							dest_row[2 * x + 1] = src_row[4 * x + 3];
+						}
+						break;
+					case 3:  // Three component, treated as RGB
+						for (size_t x = 0; x < dim_x; x++)
+						{
+							dest_row[3 * x    ] = src_row[4 * x    ];
+							dest_row[3 * x + 1] = src_row[4 * x + 1];
+							dest_row[3 * x + 2] = src_row[4 * x + 2];
+						}
+						break;
+					case 4:  // Four component, treated as RGBA
+						for (size_t x = 0; x < dim_x; x++)
+						{
+							dest_row[4 * x    ] = src_row[4 * x    ];
+							dest_row[4 * x + 1] = src_row[4 * x + 1];
+							dest_row[4 * x + 2] = src_row[4 * x + 2];
+							dest_row[4 * x + 3] = src_row[4 * x + 3];
+						}
+						break;
+					}
+				}
+			}
+		}
+
 		void* dataptr = pixel_data8.data();
 		if (bitness == 16)
 		{
 			dataptr = pixel_data16.data();
 		}
 
-		file.write(reinterpret_cast<const char*>(&hdr), sizeof(ktx_header));
 		file.write(reinterpret_cast<const char*>(&image_bytes_field), sizeof(image_bytes_field));
 		file.write(reinterpret_cast<const char*>(dataptr), image_bytes);
 		if (file.fail())
 		{
 			error = true;
+			break;
 		}
-	}
-	else
-	{
-		error = true;
 	}
 
 	return error;
+}
+
+/**
+ * @brief Save a KTX uncompressed image using a local store routine.
+ *
+ * @param img        The source data for the image.
+ * @param filename   The name of the file to save.
+ * @param y_flip     Should the image be vertically flipped?
+ *
+ * @return @c true on error, @c false on success.
+ */
+static bool store_ktx_uncompressed_image(
+	const astcenc_image* img,
+	const char* filename,
+	int y_flip
+) {
+	std::vector<const astcenc_image*> levels { img };
+	return store_ktx_uncompressed_image_mips(levels, filename, y_flip);
 }
 
 /*
@@ -2461,6 +2774,11 @@ static bool store_dds_uncompressed_image(
 using image_loader = astcenc_image_ptr(*)(const char*, bool, bool&, unsigned int&);
 
 /**
+ * @brief Image mipmap chain loader function pointer.
+ */
+using image_loader_mips = std::vector<astcenc_image_ptr>(*)(const char*, bool, bool&, unsigned int&);
+
+/**
  * @brief Specs for an image loader function.
  */
 struct loader_specs
@@ -2468,6 +2786,9 @@ struct loader_specs
 	const char* ending1;
 	const char* ending2;
 	const image_loader loader_func;
+
+	/** @brief The optional mipmap-aware loader, or @c nullptr if only one level is supported. */
+	const image_loader_mips loader_mips_func;
 };
 
 /**
@@ -2475,14 +2796,14 @@ struct loader_specs
  */
 const loader_specs loader_descs[] {
 	// LDR formats
-	{  ".png",  ".PNG", load_png_with_wuffs},
+	{  ".png",  ".PNG", load_png_with_wuffs, nullptr},
 	// HDR formats
-	{  ".exr",  ".EXR", load_image_with_tinyexr },
+	{  ".exr",  ".EXR", load_image_with_tinyexr, nullptr },
 	// Container formats
-	{  ".ktx",  ".KTX", load_ktx_uncompressed_image },
-	{  ".dds",  ".DDS", load_dds_uncompressed_image },
+	{  ".ktx",  ".KTX", load_ktx_uncompressed_image, load_ktx_uncompressed_image_mips },
+	{  ".dds",  ".DDS", load_dds_uncompressed_image, nullptr },
 	// Generic catch all; this one must be last in the list
-	{ nullptr, nullptr, load_image_with_stb }
+	{ nullptr, nullptr, load_image_with_stb, nullptr }
 };
 
 static const size_t loader_descr_count = sizeof(loader_descs) / sizeof(loader_descs[0]);
@@ -2493,6 +2814,11 @@ static const size_t loader_descr_count = sizeof(loader_descs) / sizeof(loader_de
 using image_storer = bool(*)(const astcenc_image*, const char*, int y_flip);
 
 /**
+ * @brief Image mipmap chain storer function pointer.
+ */
+using image_storer_mips = bool(*)(const std::vector<const astcenc_image*>&, const char*, int y_flip);
+
+/**
  * @brief Specs for an image storer function.
  */
 struct storer_specs
@@ -2501,6 +2827,9 @@ struct storer_specs
 	const char *ending2;
 	int enforced_bitness;
 	image_storer storer_func;
+
+	/** @brief The optional mipmap-aware storer, or @c nullptr if only one level is supported. */
+	image_storer_mips storer_mips_func;
 };
 
 /**
@@ -2508,15 +2837,15 @@ struct storer_specs
  */
 const storer_specs storer_descs[] {
 	// LDR formats
-	{ ".bmp", ".BMP",  8, store_bmp_image_with_stb },
-	{ ".png", ".PNG",  8, store_png_image_with_stb },
-	{ ".tga", ".TGA",  8, store_tga_image_with_stb },
+	{ ".bmp", ".BMP",  8, store_bmp_image_with_stb, nullptr },
+	{ ".png", ".PNG",  8, store_png_image_with_stb, nullptr },
+	{ ".tga", ".TGA",  8, store_tga_image_with_stb, nullptr },
 	// HDR formats
-	{ ".exr", ".EXR", 16, store_exr_image_with_tinyexr },
-	{ ".hdr", ".HDR", 16, store_hdr_image_with_stb },
+	{ ".exr", ".EXR", 16, store_exr_image_with_tinyexr, nullptr },
+	{ ".hdr", ".HDR", 16, store_hdr_image_with_stb, nullptr },
 	// Container formats
-	{ ".dds", ".DDS",  0, store_dds_uncompressed_image },
-	{ ".ktx", ".KTX",  0, store_ktx_uncompressed_image }
+	{ ".dds", ".DDS",  0, store_dds_uncompressed_image, nullptr },
+	{ ".ktx", ".KTX",  0, store_ktx_uncompressed_image, store_ktx_uncompressed_image_mips }
 };
 
 static const size_t storer_descr_count = sizeof(storer_descs) / sizeof(storer_descs[0]);
@@ -2544,7 +2873,7 @@ int get_output_filename_enforced_bitness(
 }
 
 /* See header for documentation. */
-astcenc_image_ptr load_ncimage(
+std::vector<astcenc_image_ptr> load_ncimage_mips(
 	const char* filename,
 	bool y_flip,
 	bool& is_hdr,
@@ -2559,6 +2888,7 @@ astcenc_image_ptr load_ncimage(
 
 	// Scan through descriptors until a matching loader is found
 	image_loader loader { nullptr };
+	image_loader_mips loader_mips { nullptr };
 	for (size_t i = 0; i < loader_descr_count; i++)
 	{
 		if (loader_descs[i].ending1 == nullptr
@@ -2566,6 +2896,7 @@ astcenc_image_ptr load_ncimage(
 			|| strcmp(eptr, loader_descs[i].ending2) == 0)
 		{
 			loader = loader_descs[i].loader_func;
+			loader_mips = loader_descs[i].loader_mips_func;
 			break;
 		}
 	}
@@ -2573,24 +2904,67 @@ astcenc_image_ptr load_ncimage(
 	// stb_image provides a fallback loader for unmatched formats
 	assert(loader);
 
+	std::vector<astcenc_image_ptr> levels;
 	try
 	{
-		return loader(filename, y_flip, is_hdr, component_count);
+		// Prefer a native mipmap chain loader; otherwise only one level can be loaded
+		if (loader_mips)
+		{
+			return loader_mips(filename, y_flip, is_hdr, component_count);
+		}
+
+		astcenc_image_ptr image = loader(filename, y_flip, is_hdr, component_count);
+		if (image)
+		{
+			levels.push_back(std::move(image));
+		}
 	}
 	catch (const std::bad_alloc &e)
 	{
 		ASTCENC_UNUSED(e);
 		print_error("ERROR: Image memory allocation failed '%s'\n", filename);
-		return nullptr;
+		levels.clear();
 	}
+
+	return levels;
 }
 
 /* See header for documentation. */
-bool store_ncimage(
-	const astcenc_image* output_image,
+astcenc_image_ptr load_ncimage(
+	const char* filename,
+	bool y_flip,
+	bool& is_hdr,
+	unsigned int& component_count
+) {
+	std::vector<astcenc_image_ptr> levels = load_ncimage_mips(
+	    filename, y_flip, is_hdr, component_count);
+	if (levels.empty())
+	{
+		return nullptr;
+	}
+
+	return std::move(levels[0]);
+}
+
+/**
+ * @brief Store an uncompressed image chain from a list of non-owning image pointers.
+ *
+ * @param levels     The source data for the image, with the base level first.
+ * @param filename   The name of the file to save.
+ * @param y_flip     Should the image be vertically flipped?
+ *
+ * @return @c true on error, @c false on success.
+ */
+static bool store_ncimage_ptrs(
+	const std::vector<const astcenc_image*>& levels,
 	const char* filename,
 	int y_flip
 ) {
+	if (levels.empty())
+	{
+		return true;
+	}
+
 	const char* eptr = strrchr(filename, '.');
 	if (!eptr)
 	{
@@ -2599,12 +2973,14 @@ bool store_ncimage(
 
 	// Scan through descriptors until a matching storer is found
 	image_storer storer { nullptr };
+	image_storer_mips storer_mips { nullptr };
 	for (size_t i = 0; i < storer_descr_count; i++)
 	{
 		if (strcmp(eptr, storer_descs[i].ending1) == 0
 		 || strcmp(eptr, storer_descs[i].ending2) == 0)
 		{
 			storer = storer_descs[i].storer_func;
+			storer_mips = storer_descs[i].storer_mips_func;
 			break;
 		}
 	}
@@ -2616,7 +2992,44 @@ bool store_ncimage(
 		return true;
 	}
 
-	return storer(output_image, filename, y_flip);
+	// Formats which do not support a mipmap chain can only retain the base level
+	if (levels.size() > 1 && !storer_mips)
+	{
+		printf("WARNING: Only the first of %zu mipmap levels will be written\n", levels.size());
+	}
+
+	if (storer_mips)
+	{
+		return storer_mips(levels, filename, y_flip);
+	}
+
+	return storer(levels[0], filename, y_flip);
+}
+
+/* See header for documentation. */
+bool store_ncimage_mips(
+	const std::vector<astcenc_image_ptr>& levels,
+	const char* filename,
+	int y_flip
+) {
+	std::vector<const astcenc_image*> level_ptrs;
+	level_ptrs.reserve(levels.size());
+	for (const astcenc_image_ptr& level : levels)
+	{
+		level_ptrs.push_back(level.get());
+	}
+
+	return store_ncimage_ptrs(level_ptrs, filename, y_flip);
+}
+
+/* See header for documentation. */
+bool store_ncimage(
+	const astcenc_image* output_image,
+	const char* filename,
+	int y_flip
+) {
+	std::vector<const astcenc_image*> levels { output_image };
+	return store_ncimage_ptrs(levels, filename, y_flip);
 }
 
 /* ============================================================================
@@ -2710,7 +3123,8 @@ bool load_cimage(
 	// Allocation may fail if image is suspiciously large
 	try
 	{
-		img.data.resize(data_size);
+		img.levels.resize(1);
+		img.levels[0].data.resize(data_size);
 	}
 	catch (const std::bad_alloc &e)
 	{
@@ -2719,11 +3133,11 @@ bool load_cimage(
 		return true;
 	}
 
-	file.read(reinterpret_cast<char*>(img.data.data()), data_size);
+	file.read(reinterpret_cast<char*>(img.levels[0].data.data()), data_size);
 	if (file.fail())
 	{
 		print_error("ERROR: File read failed '%s'\n", filename);
-		img.data.clear();
+		img.levels.clear();
 		return true;
 	}
 
@@ -2735,6 +3149,10 @@ bool load_cimage(
 	img.dim_x = dim_x;
 	img.dim_y = dim_y;
 	img.dim_z = dim_z;
+
+	img.levels[0].dim_x = dim_x;
+	img.levels[0].dim_y = dim_y;
+	img.levels[0].dim_z = dim_z;
 
 	return false;
 }
@@ -2748,6 +3166,18 @@ bool store_cimage(
 	{
 		print_error("ERROR: Image exceeds file format size limits\n");
 		return true;
+	}
+
+	// The raw .astc container has no header field for a mipmap chain
+	if (img.levels.empty())
+	{
+		print_error("ERROR: Compressed image has no levels '%s'\n", filename);
+		return true;
+	}
+
+	if (img.levels.size() > 1)
+	{
+		printf("WARNING: Only the first of %zu mipmap levels will be written\n", img.levels.size());
 	}
 
 	uint32_t dim_x = static_cast<uint32_t>(img.dim_x);
@@ -2784,7 +3214,7 @@ bool store_cimage(
 	}
 
 	file.write(reinterpret_cast<char*>(&hdr), sizeof(astc_header));
-	file.write(reinterpret_cast<const char*>(img.data.data()), img.data.size());
+	file.write(reinterpret_cast<const char*>(img.levels[0].data.data()), img.levels[0].data.size());
 	file.close();
 	return file.fail();
 }
