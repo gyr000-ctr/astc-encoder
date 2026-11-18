@@ -310,6 +310,38 @@ bool store_ktx_compressed_image(
 	bool is_srgb);
 
 /**
+ * @brief Load a compressed .ktx2 image.
+ *
+ * Only un-supercompressed ASTC textures are supported.
+ *
+ * @param      filename   The file to load.
+ * @param[out] is_srgb    Is this an sRGB encoded file?
+ * @param[out] img        The image to populate with loaded data.
+ *
+ * @return @c true on error, @c false on success.
+ */
+bool load_ktx2_compressed_image(
+	const char* filename,
+	bool& is_srgb,
+	astc_compressed_image& img);
+
+/**
+ * @brief Store a compressed .ktx2 image.
+ *
+ * Only un-supercompressed ASTC textures are written.
+ *
+ * @param img        The image to store.
+ * @param filename   The file to store.
+ * @param is_srgb    Is this an sRGB encoded file?
+ *
+ * @return @c true on error, @c false on success.
+ */
+bool store_ktx2_compressed_image(
+	const astc_compressed_image& img,
+	const char* filename,
+	bool is_srgb);
+
+/**
  * @brief Create an image from a 2D float data array.
  *
  * @param data     The raw input data.

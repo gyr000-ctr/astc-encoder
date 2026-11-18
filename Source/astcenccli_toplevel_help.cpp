@@ -610,6 +610,7 @@ COMPRESSION FILE FORMATS
 
     * ASTC (*.astc)
     * Khronos Texture KTX (*.ktx)
+    * Khronos Texture KTX2 (*.ktx2)
 
 DECOMPRESSION FILE FORMATS
 
@@ -617,6 +618,7 @@ DECOMPRESSION FILE FORMATS
 
     * ASTC (*.astc)
     * Khronos Texture KTX (*.ktx)
+    * Khronos Texture KTX2 (*.ktx2)
 
     The following formats are supported as decompression outputs:
 

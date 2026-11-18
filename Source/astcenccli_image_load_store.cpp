@@ -917,6 +917,728 @@ static unsigned int get_format(
 	return 0;
 }
 
+/* ============================================================================
+  KTX version 2 compressed image load and store
+
+  Only un-supercompressed ASTC textures (supercompressionScheme == 0) are
+  supported. See the KTX File Format Specification v2.0 and the Khronos Data
+  Format Specification 1.3 for the on-disk layout.
+============================================================================ */
+
+// Vulkan ASTC block-compressed format enum values, from vulkan_core.h
+#define VK_FORMAT_ASTC_4x4_UNORM_BLOCK                 157
+#define VK_FORMAT_ASTC_4x4_SRGB_BLOCK                  158
+#define VK_FORMAT_ASTC_5x4_UNORM_BLOCK                 159
+#define VK_FORMAT_ASTC_5x4_SRGB_BLOCK                  160
+#define VK_FORMAT_ASTC_5x5_UNORM_BLOCK                 161
+#define VK_FORMAT_ASTC_5x5_SRGB_BLOCK                  162
+#define VK_FORMAT_ASTC_6x5_UNORM_BLOCK                 163
+#define VK_FORMAT_ASTC_6x5_SRGB_BLOCK                  164
+#define VK_FORMAT_ASTC_6x6_UNORM_BLOCK                 165
+#define VK_FORMAT_ASTC_6x6_SRGB_BLOCK                  166
+#define VK_FORMAT_ASTC_8x5_UNORM_BLOCK                 167
+#define VK_FORMAT_ASTC_8x5_SRGB_BLOCK                  168
+#define VK_FORMAT_ASTC_8x6_UNORM_BLOCK                 169
+#define VK_FORMAT_ASTC_8x6_SRGB_BLOCK                  170
+#define VK_FORMAT_ASTC_8x8_UNORM_BLOCK                 171
+#define VK_FORMAT_ASTC_8x8_SRGB_BLOCK                  172
+#define VK_FORMAT_ASTC_10x5_UNORM_BLOCK                173
+#define VK_FORMAT_ASTC_10x5_SRGB_BLOCK                 174
+#define VK_FORMAT_ASTC_10x6_UNORM_BLOCK                175
+#define VK_FORMAT_ASTC_10x6_SRGB_BLOCK                 176
+#define VK_FORMAT_ASTC_10x8_UNORM_BLOCK                177
+#define VK_FORMAT_ASTC_10x8_SRGB_BLOCK                 178
+#define VK_FORMAT_ASTC_10x10_UNORM_BLOCK               179
+#define VK_FORMAT_ASTC_10x10_SRGB_BLOCK                180
+#define VK_FORMAT_ASTC_12x10_UNORM_BLOCK               181
+#define VK_FORMAT_ASTC_12x10_SRGB_BLOCK                182
+#define VK_FORMAT_ASTC_12x12_UNORM_BLOCK               183
+#define VK_FORMAT_ASTC_12x12_SRGB_BLOCK                184
+
+#define VK_FORMAT_ASTC_3x3x3_UNORM_BLOCK_EXT           1000288000
+#define VK_FORMAT_ASTC_3x3x3_SRGB_BLOCK_EXT            1000288001
+#define VK_FORMAT_ASTC_4x3x3_UNORM_BLOCK_EXT           1000288003
+#define VK_FORMAT_ASTC_4x3x3_SRGB_BLOCK_EXT            1000288004
+#define VK_FORMAT_ASTC_4x4x3_UNORM_BLOCK_EXT           1000288006
+#define VK_FORMAT_ASTC_4x4x3_SRGB_BLOCK_EXT            1000288007
+#define VK_FORMAT_ASTC_4x4x4_UNORM_BLOCK_EXT           1000288009
+#define VK_FORMAT_ASTC_4x4x4_SRGB_BLOCK_EXT            1000288010
+#define VK_FORMAT_ASTC_5x4x4_UNORM_BLOCK_EXT           1000288012
+#define VK_FORMAT_ASTC_5x4x4_SRGB_BLOCK_EXT            1000288013
+#define VK_FORMAT_ASTC_5x5x4_UNORM_BLOCK_EXT           1000288015
+#define VK_FORMAT_ASTC_5x5x4_SRGB_BLOCK_EXT            1000288016
+#define VK_FORMAT_ASTC_5x5x5_UNORM_BLOCK_EXT           1000288018
+#define VK_FORMAT_ASTC_5x5x5_SRGB_BLOCK_EXT            1000288019
+#define VK_FORMAT_ASTC_6x5x5_UNORM_BLOCK_EXT           1000288021
+#define VK_FORMAT_ASTC_6x5x5_SRGB_BLOCK_EXT            1000288022
+#define VK_FORMAT_ASTC_6x6x5_UNORM_BLOCK_EXT           1000288024
+#define VK_FORMAT_ASTC_6x6x5_SRGB_BLOCK_EXT            1000288025
+#define VK_FORMAT_ASTC_6x6x6_UNORM_BLOCK_EXT           1000288027
+#define VK_FORMAT_ASTC_6x6x6_SRGB_BLOCK_EXT            1000288028
+
+// Khronos Data Format descriptor enums, from KHR/khr_df.h
+#define KHR_DF_MODEL_ASTC                              162
+#define KHR_DF_CHANNEL_ASTC_DATA                       0
+#define KHR_DF_PRIMARIES_BT709                         1
+#define KHR_DF_TRANSFER_LINEAR                         1
+#define KHR_DF_TRANSFER_SRGB                           2
+#define KHR_DF_VERSIONNUMBER_1_3                       2
+#define KHR_DF_KHR_DESCRIPTORTYPE_BASICFORMAT          0
+#define KHR_DF_VENDORID_KHRONOS                        0
+
+// KTX2 on-disk structure sizes
+static constexpr uint32_t KTX2_HEADER_SIZE = 80;
+static constexpr uint32_t KTX2_LEVEL_INDEX_ENTRY_SIZE = 24;
+static constexpr uint32_t KTX2_DFD_SIZE = 44;
+
+// Every ASTC block is a fixed 128-bit payload, so mip levels must be aligned
+// to lcm(texel block size 16, 4) == 16 bytes
+static constexpr uint32_t KTX2_ASTC_LEVEL_ALIGNMENT = 16;
+
+// Magic 12-byte sequence that must appear at the beginning of every KTX2 file
+static uint8_t ktx2_magic[12] {
+	0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A
+};
+
+/**
+ * @brief A mapping between an ASTC block size and its Vulkan vkFormat enums.
+ */
+struct ktx2_vk_format_entry
+{
+	unsigned int x;
+	unsigned int y;
+	unsigned int z;
+	uint32_t unorm_format;
+	uint32_t srgb_format;
+};
+
+// All ASTC block sizes that have a Vulkan vkFormat mapping
+static const std::array<ktx2_vk_format_entry, 24> KTX2_VK_FORMATS =
+{{
+	// 2D block sizes
+	{ 4,  4, 1, VK_FORMAT_ASTC_4x4_UNORM_BLOCK,    VK_FORMAT_ASTC_4x4_SRGB_BLOCK},
+	{ 5,  4, 1, VK_FORMAT_ASTC_5x4_UNORM_BLOCK,    VK_FORMAT_ASTC_5x4_SRGB_BLOCK},
+	{ 5,  5, 1, VK_FORMAT_ASTC_5x5_UNORM_BLOCK,    VK_FORMAT_ASTC_5x5_SRGB_BLOCK},
+	{ 6,  5, 1, VK_FORMAT_ASTC_6x5_UNORM_BLOCK,    VK_FORMAT_ASTC_6x5_SRGB_BLOCK},
+	{ 6,  6, 1, VK_FORMAT_ASTC_6x6_UNORM_BLOCK,    VK_FORMAT_ASTC_6x6_SRGB_BLOCK},
+	{ 8,  5, 1, VK_FORMAT_ASTC_8x5_UNORM_BLOCK,    VK_FORMAT_ASTC_8x5_SRGB_BLOCK},
+	{ 8,  6, 1, VK_FORMAT_ASTC_8x6_UNORM_BLOCK,    VK_FORMAT_ASTC_8x6_SRGB_BLOCK},
+	{ 8,  8, 1, VK_FORMAT_ASTC_8x8_UNORM_BLOCK,    VK_FORMAT_ASTC_8x8_SRGB_BLOCK},
+	{10,  5, 1, VK_FORMAT_ASTC_10x5_UNORM_BLOCK,   VK_FORMAT_ASTC_10x5_SRGB_BLOCK},
+	{10,  6, 1, VK_FORMAT_ASTC_10x6_UNORM_BLOCK,   VK_FORMAT_ASTC_10x6_SRGB_BLOCK},
+	{10,  8, 1, VK_FORMAT_ASTC_10x8_UNORM_BLOCK,   VK_FORMAT_ASTC_10x8_SRGB_BLOCK},
+	{10, 10, 1, VK_FORMAT_ASTC_10x10_UNORM_BLOCK,  VK_FORMAT_ASTC_10x10_SRGB_BLOCK},
+	{12, 10, 1, VK_FORMAT_ASTC_12x10_UNORM_BLOCK,  VK_FORMAT_ASTC_12x10_SRGB_BLOCK},
+	{12, 12, 1, VK_FORMAT_ASTC_12x12_UNORM_BLOCK,  VK_FORMAT_ASTC_12x12_SRGB_BLOCK},
+	// 3D block sizes
+	{3, 3, 3, VK_FORMAT_ASTC_3x3x3_UNORM_BLOCK_EXT, VK_FORMAT_ASTC_3x3x3_SRGB_BLOCK_EXT},
+	{4, 3, 3, VK_FORMAT_ASTC_4x3x3_UNORM_BLOCK_EXT, VK_FORMAT_ASTC_4x3x3_SRGB_BLOCK_EXT},
+	{4, 4, 3, VK_FORMAT_ASTC_4x4x3_UNORM_BLOCK_EXT, VK_FORMAT_ASTC_4x4x3_SRGB_BLOCK_EXT},
+	{4, 4, 4, VK_FORMAT_ASTC_4x4x4_UNORM_BLOCK_EXT, VK_FORMAT_ASTC_4x4x4_SRGB_BLOCK_EXT},
+	{5, 4, 4, VK_FORMAT_ASTC_5x4x4_UNORM_BLOCK_EXT, VK_FORMAT_ASTC_5x4x4_SRGB_BLOCK_EXT},
+	{5, 5, 4, VK_FORMAT_ASTC_5x5x4_UNORM_BLOCK_EXT, VK_FORMAT_ASTC_5x5x4_SRGB_BLOCK_EXT},
+	{5, 5, 5, VK_FORMAT_ASTC_5x5x5_UNORM_BLOCK_EXT, VK_FORMAT_ASTC_5x5x5_SRGB_BLOCK_EXT},
+	{6, 5, 5, VK_FORMAT_ASTC_6x5x5_UNORM_BLOCK_EXT, VK_FORMAT_ASTC_6x5x5_SRGB_BLOCK_EXT},
+	{6, 6, 5, VK_FORMAT_ASTC_6x6x5_UNORM_BLOCK_EXT, VK_FORMAT_ASTC_6x6x5_SRGB_BLOCK_EXT},
+	{6, 6, 6, VK_FORMAT_ASTC_6x6x6_UNORM_BLOCK_EXT, VK_FORMAT_ASTC_6x6x6_SRGB_BLOCK_EXT}
+}};
+
+/**
+ * @brief Look up the vkFormat table entry for a block size.
+ *
+ * @param block_x   The block width in texels.
+ * @param block_y   The block height in texels.
+ * @param block_z   The block depth in texels.
+ *
+ * @return The matching table entry, or @c nullptr if the block size is unknown.
+ */
+static const ktx2_vk_format_entry* get_vk_astc_format(
+	unsigned int block_x,
+	unsigned int block_y,
+	unsigned int block_z
+) {
+	for (auto& it : KTX2_VK_FORMATS)
+	{
+		if ((it.x == block_x) && (it.y == block_y) && (it.z == block_z))
+		{
+			return &it;
+		}
+	}
+	return nullptr;
+}
+
+/**
+ * @brief Look up the vkFormat table entry for a Vulkan format enum.
+ *
+ * @param vk_format   The Vulkan @c VkFormat enum value.
+ * @param[out] is_srgb   Set to @c true if the enum names an sRGB format.
+ *
+ * @return The matching table entry, or @c nullptr if the format is not ASTC.
+ */
+static const ktx2_vk_format_entry* get_vk_astc_format(
+	uint32_t vk_format,
+	bool& is_srgb
+) {
+	for (auto& it : KTX2_VK_FORMATS)
+	{
+		if (it.unorm_format == vk_format)
+		{
+			is_srgb = false;
+			return &it;
+		}
+
+		if (it.srgb_format == vk_format)
+		{
+			is_srgb = true;
+			return &it;
+		}
+	}
+	return nullptr;
+}
+
+/**
+ * @brief Read a little-endian uint32_t from a file.
+ *
+ * @param      file   The file to read.
+ * @param[out] value  The decoded value.
+ *
+ * @return @c true on a read failure, @c false on success.
+ */
+static bool read_le_u32(
+	std::ifstream& file,
+	uint32_t& value
+) {
+	uint8_t bytes[4];
+	file.read(reinterpret_cast<char*>(bytes), sizeof(bytes));
+	if (file.fail())
+	{
+		return true;
+	}
+
+	value = static_cast<uint32_t>(bytes[0]) |
+	        (static_cast<uint32_t>(bytes[1]) << 8) |
+	        (static_cast<uint32_t>(bytes[2]) << 16) |
+	        (static_cast<uint32_t>(bytes[3]) << 24);
+	return false;
+}
+
+/**
+ * @brief Read a little-endian uint64_t from a file.
+ *
+ * @param      file   The file to read.
+ * @param[out] value  The decoded value.
+ *
+ * @return @c true on a read failure, @c false on success.
+ */
+static bool read_le_u64(
+	std::ifstream& file,
+	uint64_t& value
+) {
+	uint8_t bytes[8];
+	file.read(reinterpret_cast<char*>(bytes), sizeof(bytes));
+	if (file.fail())
+	{
+		return true;
+	}
+
+	value = 0;
+	for (int i = 7; i >= 0; i--)
+	{
+		value = (value << 8) | static_cast<uint64_t>(bytes[i]);
+	}
+	return false;
+}
+
+/**
+ * @brief Write a little-endian uint32_t to a file.
+ *
+ * @param file   The file to write.
+ * @param value  The value to encode.
+ */
+static void write_le_u32(
+	std::ofstream& file,
+	uint32_t value
+) {
+	uint8_t bytes[4] {
+		static_cast<uint8_t>(value),
+		static_cast<uint8_t>(value >> 8),
+		static_cast<uint8_t>(value >> 16),
+		static_cast<uint8_t>(value >> 24)
+	};
+	file.write(reinterpret_cast<const char*>(bytes), sizeof(bytes));
+}
+
+/**
+ * @brief Write a little-endian uint64_t to a file.
+ *
+ * @param file   The file to write.
+ * @param value  The value to encode.
+ */
+static void write_le_u64(
+	std::ofstream& file,
+	uint64_t value
+) {
+	uint8_t bytes[8];
+	for (int i = 0; i < 8; i++)
+	{
+		bytes[i] = static_cast<uint8_t>(value >> (8 * i));
+	}
+	file.write(reinterpret_cast<const char*>(bytes), sizeof(bytes));
+}
+
+/**
+ * @brief Round a byte offset up to an alignment boundary.
+ *
+ * @param offset      The byte offset to align.
+ * @param alignment   The alignment, which must be a power of two.
+ *
+ * @return The aligned offset.
+ */
+static uint64_t align_up_u64(
+	uint64_t offset,
+	uint32_t alignment
+) {
+	return (offset + (alignment - 1)) & ~static_cast<uint64_t>(alignment - 1);
+}
+
+/**
+ * @brief Build the 44-byte Khronos Data Format descriptor for an ASTC texture.
+ *
+ * The descriptor holds a single 128-bit ASTC block sample, matching the
+ * descriptor emitted by the Khronos KTX-Software library.
+ *
+ * @param block_x   The block width in texels.
+ * @param block_y   The block height in texels.
+ * @param block_z   The block depth in texels.
+ * @param is_srgb   @c true for an sRGB transfer function, @c false for linear.
+ *
+ * @return The 11 little-endian uint32_t words of the descriptor.
+ */
+static std::array<uint32_t, 11> build_astc_dfd(
+	unsigned int block_x,
+	unsigned int block_y,
+	unsigned int block_z,
+	bool is_srgb
+) {
+	std::array<uint32_t, 11> dfd {};
+
+	// dfdTotalSize, including this leading size field
+	dfd[0] = KTX2_DFD_SIZE;
+
+	// Basic descriptor block header
+	dfd[1] = (KHR_DF_KHR_DESCRIPTORTYPE_BASICFORMAT << 17) |
+	         KHR_DF_VENDORID_KHRONOS;
+	dfd[2] = (40u << 16) | KHR_DF_VERSIONNUMBER_1_3;
+	dfd[3] = (static_cast<uint32_t>(is_srgb ? KHR_DF_TRANSFER_SRGB
+	                                        : KHR_DF_TRANSFER_LINEAR) << 16) |
+	         (KHR_DF_PRIMARIES_BT709 << 8) |
+	         KHR_DF_MODEL_ASTC;
+
+	// Texel block dimensions are stored as (dimension - 1)
+	dfd[4] = (block_x - 1) |
+	         ((block_y - 1) << 8) |
+	         ((block_z - 1) << 16);
+
+	// One 16-byte plane of ASTC block data
+	dfd[5] = 16;
+
+	// Single ASTC data sample: bit offset 0, length 128 stored as 127,
+	// channel id KHR_DF_CHANNEL_ASTC_DATA, no qualifier flags
+	dfd[6] = (127u << 16);
+	dfd[7] = 0;   // Sample positions
+	dfd[8] = 0;   // sampleLower
+	dfd[9] = 0;   // Unused BDFD padding word
+	dfd[10] = 0xFFFFFFFFu;  // sampleUpper
+
+	return dfd;
+}
+
+/**
+ * @brief Store a KTX2 compressed ASTC image using a local store routine.
+ *
+ * @param img        The image data to store.
+ * @param filename   The name of the file to save.
+ * @param is_srgb    @c true if this is an sRGB image, @c false if linear.
+ *
+ * @return @c true on error, @c false on success.
+ */
+bool store_ktx2_compressed_image(
+	const astc_compressed_image& img,
+	const char* filename,
+	bool is_srgb
+) {
+	if ((img.dim_x > max_u32) || (img.dim_y > max_u32) || (img.dim_z > max_u32))
+	{
+		print_error("ERROR: Image exceeds file format size limits\n");
+		return true;
+	}
+
+	const ktx2_vk_format_entry* vk = get_vk_astc_format(img.block_x, img.block_y, img.block_z);
+	if (!vk)
+	{
+		print_error("ERROR: Image uses unsupported ASTC block size for KTX2 output '%s'\n",
+		            filename);
+		return true;
+	}
+
+	// The payload must be exactly one 16-byte block per block grid cell
+	bool overflow { false };
+	size_t blocks_x = astc::get_block_count_safe(img.dim_x, img.block_x);
+	size_t blocks_y = astc::get_block_count_safe(img.dim_y, img.block_y);
+	size_t blocks_z = astc::get_block_count_safe(img.dim_z, img.block_z);
+
+	size_t expected_size = astc::mul_safe(blocks_x, blocks_y, overflow);
+	expected_size = astc::mul_safe(expected_size, blocks_z, overflow);
+	expected_size = astc::mul_safe(expected_size, 16, overflow);
+
+	if (overflow || (img.data.size() != expected_size))
+	{
+		print_error("ERROR: Image header corrupt '%s'\n", filename);
+		return true;
+	}
+
+	// File layout: header, level index, DFD, aligned level data
+	uint32_t dfd_offset = KTX2_HEADER_SIZE + KTX2_LEVEL_INDEX_ENTRY_SIZE;
+	uint64_t level_offset = align_up_u64(
+	    static_cast<uint64_t>(dfd_offset) + KTX2_DFD_SIZE,
+	    KTX2_ASTC_LEVEL_ALIGNMENT);
+
+	std::ofstream file(filename, std::ios::out | std::ios::binary | std::ios::trunc);
+	if (!file)
+	{
+		print_error("ERROR: File open failed '%s'\n", filename);
+		return true;
+	}
+
+	// Identifier
+	file.write(reinterpret_cast<const char*>(ktx2_magic), sizeof(ktx2_magic));
+
+	// Header index fields, all little-endian on disk
+	write_le_u32(file, is_srgb ? vk->srgb_format : vk->unorm_format);  // vkFormat
+	write_le_u32(file, 1);                                              // typeSize
+	write_le_u32(file, static_cast<uint32_t>(img.dim_x));               // pixelWidth
+	write_le_u32(file, static_cast<uint32_t>(img.dim_y));               // pixelHeight
+	write_le_u32(file, img.block_z == 1 ? 0u : static_cast<uint32_t>(img.dim_z));  // pixelDepth
+	write_le_u32(file, 0);                                              // layerCount
+	write_le_u32(file, 1);                                              // faceCount
+	write_le_u32(file, 1);                                              // levelCount
+	write_le_u32(file, 0);                                              // supercompressionScheme
+
+	write_le_u32(file, dfd_offset);                                     // dfdByteOffset
+	write_le_u32(file, KTX2_DFD_SIZE);                                  // dfdByteLength
+	write_le_u32(file, 0);                                              // kvdByteOffset
+	write_le_u32(file, 0);                                              // kvdByteLength
+	write_le_u64(file, 0);                                              // sgdByteOffset
+	write_le_u64(file, 0);                                              // sgdByteLength
+
+	// The level index always starts directly after the 80-byte header
+	write_le_u64(file, level_offset);                                   // byteOffset
+	write_le_u64(file, expected_size);                                  // byteLength
+	write_le_u64(file, expected_size);                                  // uncompressedByteLength
+
+	// Data Format Descriptor
+	std::array<uint32_t, 11> dfd = build_astc_dfd(
+	    img.block_x, img.block_y, img.block_z, is_srgb);
+	for (uint32_t word : dfd)
+	{
+		write_le_u32(file, word);
+	}
+
+	// Zero padding up to the aligned level data offset
+	uint64_t padding = level_offset - (static_cast<uint64_t>(dfd_offset) + KTX2_DFD_SIZE);
+	for (uint64_t i = 0; i < padding; i++)
+	{
+		file.put(0);
+	}
+
+	// Level payload
+	file.write(reinterpret_cast<const char*>(img.data.data()), img.data.size());
+	file.close();
+
+	if (file.fail())
+	{
+		print_error("ERROR: File write failed '%s'\n", filename);
+		return true;
+	}
+
+	return false;
+}
+
+/**
+ * @brief Load a KTX2 compressed ASTC image using the local custom loader.
+ *
+ * @param      filename   The name of the file to load.
+ * @param[out] is_srgb    @c true if this is an sRGB image, @c false otherwise.
+ * @param[out] img        The output image to populate.
+ *
+ * @return @c true on error, @c false on success.
+ */
+bool load_ktx2_compressed_image(
+	const char* filename,
+	bool& is_srgb,
+	astc_compressed_image& img
+) {
+	std::ifstream file(filename, std::ios::in | std::ios::binary);
+	if (!file)
+	{
+		print_error("ERROR: File open failed '%s'\n", filename);
+		return true;
+	}
+
+	uint8_t magic[12];
+	file.read(reinterpret_cast<char*>(magic), sizeof(magic));
+	if (file.fail() || (memcmp(magic, ktx2_magic, sizeof(magic)) != 0))
+	{
+		print_error("ERROR: Image header corrupt '%s'\n", filename);
+		return true;
+	}
+
+	// Read the header fields following the 12-byte identifier
+	uint32_t vk_format;
+	uint32_t type_size;
+	uint32_t pixel_width;
+	uint32_t pixel_height;
+	uint32_t pixel_depth;
+	uint32_t layer_count;
+	uint32_t face_count;
+	uint32_t level_count;
+	uint32_t supercompression_scheme;
+	uint32_t dfd_byte_offset;
+	uint32_t dfd_byte_length;
+	uint32_t kvd_byte_offset;
+	uint32_t kvd_byte_length;
+	uint64_t sgd_byte_offset;
+	uint64_t sgd_byte_length;
+
+	if (read_le_u32(file, vk_format) ||
+	    read_le_u32(file, type_size) ||
+	    read_le_u32(file, pixel_width) ||
+	    read_le_u32(file, pixel_height) ||
+	    read_le_u32(file, pixel_depth) ||
+	    read_le_u32(file, layer_count) ||
+	    read_le_u32(file, face_count) ||
+	    read_le_u32(file, level_count) ||
+	    read_le_u32(file, supercompression_scheme) ||
+	    read_le_u32(file, dfd_byte_offset) ||
+	    read_le_u32(file, dfd_byte_length) ||
+	    read_le_u32(file, kvd_byte_offset) ||
+	    read_le_u32(file, kvd_byte_length) ||
+	    read_le_u64(file, sgd_byte_offset) ||
+	    read_le_u64(file, sgd_byte_length))
+	{
+		print_error("ERROR: File read failed '%s'\n", filename);
+		return true;
+	}
+
+	if (supercompression_scheme != 0)
+	{
+		print_error("ERROR: KTX2 supercompression is not supported '%s'\n", filename);
+		return true;
+	}
+
+	if (type_size != 1)
+	{
+		print_error("ERROR: Image uses unsupported KTX2 format '%s'\n", filename);
+		return true;
+	}
+
+	if ((layer_count != 0) || (face_count != 1))
+	{
+		print_error("ERROR: KTX2 texture arrays and cube maps are not supported '%s'\n",
+		            filename);
+		return true;
+	}
+
+	if (pixel_width == 0)
+	{
+		print_error("ERROR: Image header corrupt '%s'\n", filename);
+		return true;
+	}
+
+	// The level index is mandatory for block-compressed KTX2 files; it always
+	// starts directly after the 80-byte header and holds one entry per level
+	if (level_count == 0)
+	{
+		print_error("ERROR: KTX2 mip level index is missing or truncated '%s'\n",
+		            filename);
+		return true;
+	}
+
+	constexpr uint64_t level_index_offset = KTX2_HEADER_SIZE;
+
+	// Sanity check the number of levels against the base dimensions
+	uint32_t max_dim = astc::max(astc::max(pixel_width, pixel_height), pixel_depth);
+	if ((max_dim == 0) || (max_dim < (1u << (level_count - 1))))
+	{
+		print_error("ERROR: Image header corrupt '%s'\n", filename);
+		return true;
+	}
+
+	// Resolve the vkFormat to a known ASTC block size
+	bool dfd_is_srgb = false;
+	const ktx2_vk_format_entry* vk = get_vk_astc_format(vk_format, dfd_is_srgb);
+	if (!vk)
+	{
+		print_error("ERROR: Image uses unsupported KTX2 format '%s'\n", filename);
+		return true;
+	}
+
+	// Read the base level index entry (level index is ordered base level first)
+	file.seekg(static_cast<std::streamoff>(level_index_offset), std::ios::beg);
+	if (file.fail())
+	{
+		print_error("ERROR: File read failed '%s'\n", filename);
+		return true;
+	}
+
+	uint64_t level_byte_offset;
+	uint64_t level_byte_length;
+	uint64_t level_uncompressed_length;
+	if (read_le_u64(file, level_byte_offset) ||
+	    read_le_u64(file, level_byte_length) ||
+	    read_le_u64(file, level_uncompressed_length))
+	{
+		print_error("ERROR: File read failed '%s'\n", filename);
+		return true;
+	}
+
+	// With no supercompression the two lengths must match
+	if ((level_byte_offset == 0) || (level_byte_length != level_uncompressed_length))
+	{
+		print_error("ERROR: KTX2 mip level index is missing or truncated '%s'\n",
+		            filename);
+		return true;
+	}
+
+	// Locate and validate the Data Format Descriptor. A single-block ASTC
+	// descriptor holds the leading size word plus a 40-byte basic block
+	if ((dfd_byte_offset == 0) || (dfd_byte_length < KTX2_DFD_SIZE))
+	{
+		print_error("ERROR: KTX2 data format descriptor is missing or invalid '%s'\n",
+		            filename);
+		return true;
+	}
+
+	file.seekg(static_cast<std::streamoff>(dfd_byte_offset), std::ios::beg);
+	if (file.fail())
+	{
+		print_error("ERROR: File read failed '%s'\n", filename);
+		return true;
+	}
+
+	uint32_t dfd_total_size;
+	if (read_le_u32(file, dfd_total_size) || (dfd_total_size != dfd_byte_length))
+	{
+		print_error("ERROR: KTX2 data format descriptor is missing or invalid '%s'\n",
+		            filename);
+		return true;
+	}
+
+	uint32_t bdfd[10];
+	for (uint32_t& word : bdfd)
+	{
+		if (read_le_u32(file, word))
+		{
+			print_error("ERROR: File read failed '%s'\n", filename);
+			return true;
+		}
+	}
+
+	uint32_t descriptor_block_size = (bdfd[1] >> 16) & 0xFFFF;
+	uint32_t color_model = bdfd[2] & 0xFF;
+	uint32_t block_dim0 = bdfd[3] & 0xFF;
+	uint32_t block_dim1 = (bdfd[3] >> 8) & 0xFF;
+	uint32_t block_dim2 = (bdfd[3] >> 16) & 0xFF;
+	uint32_t bytes_plane0 = bdfd[4] & 0xFF;
+
+	if ((descriptor_block_size < 24) || ((descriptor_block_size - 24) % 16 != 0))
+	{
+		print_error("ERROR: KTX2 data format descriptor does not match vkFormat '%s'\n",
+		            filename);
+		return true;
+	}
+
+	uint32_t sample_count = (descriptor_block_size - 24) / 16;
+	if ((sample_count != 1) || (color_model != KHR_DF_MODEL_ASTC) ||
+	    (bytes_plane0 != 16))
+	{
+		print_error("ERROR: KTX2 data format descriptor does not match vkFormat '%s'\n",
+		            filename);
+		return true;
+	}
+
+	// The DFD block dimensions must match the vkFormat block size
+	if ((block_dim0 != (vk->x - 1)) ||
+	    (block_dim1 != (vk->y - 1)) ||
+	    (block_dim2 != (vk->z - 1)))
+	{
+		print_error("ERROR: KTX2 data format descriptor block size does not match vkFormat '%s'\n",
+		            filename);
+		return true;
+	}
+
+	// The single sample must describe ASTC data
+	uint32_t sample_channel = (bdfd[6] >> 24) & 0xF;
+	if (sample_channel != KHR_DF_CHANNEL_ASTC_DATA)
+	{
+		print_error("ERROR: KTX2 data format descriptor does not match vkFormat '%s'\n",
+		            filename);
+		return true;
+	}
+
+	// Verify that the level payload is large enough for the image dimensions
+	size_t block_x = vk->x;
+	size_t block_y = vk->y;
+	size_t block_z = vk->z;
+
+	size_t dim_z = pixel_depth == 0 ? 1 : pixel_depth;
+	size_t blocks_x = astc::get_block_count_safe(pixel_width, block_x);
+	size_t blocks_y = astc::get_block_count_safe(astc::max(pixel_height, 1u), block_y);
+	size_t blocks_z = astc::get_block_count_safe(dim_z, block_z);
+
+	bool overflow { false };
+	size_t size_needed = astc::mul_safe(blocks_x, blocks_y, overflow);
+	size_needed = astc::mul_safe(size_needed, blocks_z, overflow);
+	size_needed = astc::mul_safe(size_needed, 16, overflow);
+
+	if (overflow || (level_byte_length < size_needed))
+	{
+		print_error("ERROR: Image header corrupt '%s'\n", filename);
+		return true;
+	}
+
+	// Read the base level payload, keeping only the bytes that the block grid
+	// requires (a level index length may include additional alignment padding)
+	file.seekg(static_cast<std::streamoff>(level_byte_offset), std::ios::beg);
+	if (file.fail())
+	{
+		print_error("ERROR: File read failed '%s'\n", filename);
+		return true;
+	}
+
+	img.data.resize(size_needed);
+	file.read(reinterpret_cast<char*>(img.data.data()),
+	          static_cast<std::streamsize>(size_needed));
+	if (file.fail())
+	{
+		print_error("ERROR: File read failed '%s'\n", filename);
+		img.data.clear();
+		return true;
+	}
+
+	img.block_x = vk->x;
+	img.block_y = vk->y;
+	img.block_z = vk->z;
+
+	img.dim_x = pixel_width;
+	img.dim_y = astc::max(pixel_height, 1u);
+	img.dim_z = dim_z;
+
+	is_srgb = dfd_is_srgb;
+
+	return false;
+}
+
 struct ktx_header
 {
 	uint8_t magic[12];

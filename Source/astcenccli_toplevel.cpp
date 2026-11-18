@@ -2616,6 +2616,25 @@ int astcenc_main(
 				printf("WARNING: Input file is linear, but decompressing as sRGB\n");
 			}
 		}
+		else if (ends_with(input_filename, ".ktx2"))
+		{
+			bool is_srgb;
+			error = load_ktx2_compressed_image(input_filename.c_str(), is_srgb, image_comp);
+			if (error)
+			{
+				return 1;
+			}
+
+			if (is_srgb && (profile != ASTCENC_PRF_LDR_SRGB))
+			{
+				printf("WARNING: Input file is sRGB, but decompressing as linear\n");
+			}
+
+			if (!is_srgb && (profile == ASTCENC_PRF_LDR_SRGB))
+			{
+				printf("WARNING: Input file is linear, but decompressing as sRGB\n");
+			}
+		}
 		else
 		{
 			print_error("ERROR: Unknown compressed input file type\n");
@@ -2702,7 +2721,8 @@ int astcenc_main(
 
 	if (operation & ASTCENC_STAGE_ST_COMP)
 	{
-		if (!(is_null || ends_with(output_filename, ".astc") || ends_with(output_filename, ".ktx")))
+		if (!(is_null || ends_with(output_filename, ".astc") ||
+		      ends_with(output_filename, ".ktx") || ends_with(output_filename, ".ktx2")))
 		{
 			const char *eptr = strrchr(output_filename.c_str(), '.');
 			eptr = eptr ? eptr : "";
@@ -3054,6 +3074,16 @@ int astcenc_main(
 		{
 			bool srgb = profile == ASTCENC_PRF_LDR_SRGB;
 			error = store_ktx_compressed_image(image_comp, output_filename.c_str(), srgb);
+			if (error)
+			{
+				print_error("ERROR: Failed to store compressed image\n");
+				return 1;
+			}
+		}
+		else if (ends_with(output_filename, ".ktx2"))
+		{
+			bool srgb = profile == ASTCENC_PRF_LDR_SRGB;
+			error = store_ktx2_compressed_image(image_comp, output_filename.c_str(), srgb);
 			if (error)
 			{
 				print_error("ERROR: Failed to store compressed image\n");
