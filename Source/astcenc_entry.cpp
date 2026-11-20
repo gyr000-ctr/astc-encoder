@@ -1594,6 +1594,372 @@ astcenc_error astcenc_get_block_info(
 #endif
 }
 
+/**
+ * @brief Validate a public symbolic block storage argument and access its private contents.
+ *
+ * @param      block   The public opaque storage.
+ * @param      writable  True if the call writes the storage, false if it only reads it.
+ *
+ * @return A pointer to the private symbolic block, or @c nullptr if the storage is invalid.
+ */
+static symbolic_compressed_block* get_symbolic_block_storage(
+	astcenc_symbolic_block* block,
+	bool writable
+) {
+	(void)writable;
+
+	// The public opaque storage must always be able to hold the private representation, including
+	// its stricter alignment, or block-level calls could silently corrupt caller stack memory.
+	static_assert(sizeof(astcenc_aligned_storage::bytes) >= sizeof(symbolic_compressed_block),
+	              "astcenc_symbolic_block storage is too small for symbolic_compressed_block");
+	static_assert(alignof(astcenc_aligned_storage) >= alignof(symbolic_compressed_block),
+	              "astcenc_symbolic_block storage is under-aligned for symbolic_compressed_block");
+
+	if (!block || (block->size < sizeof(symbolic_compressed_block)))
+	{
+		return nullptr;
+	}
+
+	// The public storage is a raw byte buffer; callers writing it placement-new the private type
+	// into this aligned storage, so no heap allocation is involved.
+	return std::launder(reinterpret_cast<symbolic_compressed_block*>(block->storage.bytes));
+}
+
+/* See header for documentation. */
+astcenc_error astcenc_physical_to_symbolic(
+	astcenc_context* ctxo,
+	const uint8_t data[16],
+	astcenc_symbolic_block* block
+) {
+	symbolic_compressed_block* scb = get_symbolic_block_storage(block, true);
+	if (!ctxo || !data || !scb)
+	{
+		return ASTCENC_ERR_BAD_PARAM;
+	}
+
+	// Start a fresh private object lifetime inside the caller-provided storage
+	scb = new (scb) symbolic_compressed_block;
+
+	astcenc_contexti* ctx = &ctxo->context;
+	physical_to_symbolic(*ctx->bsd, data, *scb);
+
+	return ASTCENC_SUCCESS;
+}
+
+#if !defined(ASTCENC_DECOMPRESS_ONLY)
+
+/* See header for documentation. */
+astcenc_error astcenc_symbolic_to_physical(
+	astcenc_context* ctxo,
+	const astcenc_symbolic_block* block,
+	uint8_t data[16]
+) {
+	const symbolic_compressed_block* scb =
+		get_symbolic_block_storage(const_cast<astcenc_symbolic_block*>(block), false);
+	if (!ctxo || !data || !scb)
+	{
+		return ASTCENC_ERR_BAD_PARAM;
+	}
+
+	if (scb->block_type == SYM_BTYPE_ERROR)
+	{
+		return ASTCENC_ERR_BAD_BLOCK;
+	}
+
+	astcenc_contexti* ctx = &ctxo->context;
+	symbolic_to_physical(*ctx->bsd, *scb, data);
+
+	return ASTCENC_SUCCESS;
+}
+
+/* See header for documentation. */
+astcenc_error astcenc_compress_block(
+	astcenc_context* ctxo,
+	const astcenc_image* imagep,
+	const astcenc_swizzle* swizzle,
+	size_t pos_x,
+	size_t pos_y,
+	size_t pos_z,
+	uint8_t data_out[16],
+	size_t thread_index
+) {
+	if (!ctxo || !imagep || !swizzle || !data_out)
+	{
+		return ASTCENC_ERR_BAD_PARAM;
+	}
+
+	astcenc_contexti* ctx = &ctxo->context;
+
+	if (ctx->config.flags & ASTCENC_FLG_DECOMPRESS_ONLY)
+	{
+		return ASTCENC_ERR_BAD_CONTEXT;
+	}
+
+	// Whole-image-only passes have no single-block equivalent and would silently break byte
+	// parity with astcenc_compress_image(); reject them rather than emit divergent blocks.
+	bool enable_lz_rdo = (ctx->config.flags & ASTCENC_FLG_USE_LZ_RDO) &&
+	                     (ctx->config.lz_rdo_lambda > 0.0f);
+	if (enable_lz_rdo || (ctx->config.a_scale_radius != 0))
+	{
+		return ASTCENC_ERR_BAD_PARAM;
+	}
+
+	astcenc_error status = validate_compression_swizzle(*swizzle);
+	if (status != ASTCENC_SUCCESS)
+	{
+		return status;
+	}
+
+	if (thread_index >= ctx->thread_count)
+	{
+		return ASTCENC_ERR_BAD_PARAM;
+	}
+
+	const block_size_descriptor& bsd = *ctx->bsd;
+
+	// Reject block coordinates outside the image's block grid; edge blocks load clamped texels
+	size_t blocks_x = astc::get_block_count_safe(imagep->dim_x, bsd.dim_x);
+	size_t blocks_y = astc::get_block_count_safe(imagep->dim_y, bsd.dim_y);
+	size_t blocks_z = astc::get_block_count_safe(imagep->dim_z, bsd.dim_z);
+	if ((pos_x >= blocks_x) || (pos_y >= blocks_y) || (pos_z >= blocks_z))
+	{
+		return ASTCENC_ERR_BAD_PARAM;
+	}
+
+	// Validate image storage through the same path used by the whole-image compressor
+	astcenc_image image = *imagep;
+	size_t texel_count = validate_image(image, ctx->config.block_z);
+	if (texel_count == 0)
+	{
+		return ASTCENC_ERR_BAD_PARAM;
+	}
+
+	image_block blk {};
+	blk.texel_count = static_cast<uint8_t>(bsd.dim_x * bsd.dim_y * bsd.dim_z);
+	blk.decode_unorm8 = ctx->config.flags & ASTCENC_FLG_USE_DECODE_UNORM8;
+
+	bool is_ldr = (ctx->config.profile == ASTCENC_PRF_LDR) ||
+	              (ctx->config.profile == ASTCENC_PRF_LDR_SRGB);
+	blk.active_channel_mask = is_ldr ? ctx->active_channel_mask : 0xF;
+
+	bool needs_swz = (swizzle->r != ASTCENC_SWZ_R) || (swizzle->g != ASTCENC_SWZ_G) ||
+	                 (swizzle->b != ASTCENC_SWZ_B) || (swizzle->a != ASTCENC_SWZ_A);
+	bool is_hdr = (ctx->config.profile == ASTCENC_PRF_HDR) ||
+	              (ctx->config.profile == ASTCENC_PRF_HDR_RGB_LDR_A);
+
+	// Match the loader selection in compress_image()
+	bool use_fast_load = !needs_swz && !is_hdr &&
+	                     (bsd.dim_z == 1) && (image.data_type == ASTCENC_TYPE_U8);
+
+	auto load_func = use_fast_load ? load_image_block_fast_ldr : load_image_block;
+	load_func(ctx->config.profile, image, blk, bsd,
+	          pos_x * bsd.dim_x, pos_y * bsd.dim_y, pos_z * bsd.dim_z, *swizzle);
+
+	blk.channel_weight = vfloat4(ctx->config.cw_r_weight,
+	                             ctx->config.cw_g_weight,
+	                             ctx->config.cw_b_weight,
+	                             ctx->config.cw_a_weight);
+
+	if (is_hdr && (ctx->config.flags & ASTCENC_FLG_USE_PERCEPTUAL))
+	{
+		vfloat4 mean = blk.data_mean;
+		mean.set_lane<3>(0.0f);
+		vfloat4 geometric_mean = float16_to_float(lns_to_sf16(float_to_int(mean)));
+		float maximum = astc::max(hmax_s(geometric_mean), 1e-20f);
+		vfloat4 weights = max(geometric_mean / maximum, vfloat4(0.01f));
+		weights.set_lane<3>(1.0f);
+		blk.channel_weight = weights * blk.channel_weight;
+	}
+
+	if (ctx->config.flags & ASTCENC_FLG_USE_ALPHA_WEIGHT)
+	{
+		float alpha_scale = blk.data_max.lane<3>() * (1.0f / 65535.0f);
+		if (ctx->config.profile == ASTCENC_PRF_HDR)
+		{
+			vint4 alpha_lns = float_to_int(blk.data_max);
+			vfloat4 alpha = float16_to_float(lns_to_sf16(alpha_lns));
+			alpha_scale = astc::clamp1f(alpha.lane<3>());
+		}
+
+		blk.channel_weight = blk.channel_weight
+		                   * vfloat4(alpha_scale, alpha_scale, alpha_scale, 1.0f);
+	}
+
+	// Reuse the preallocated per-thread scratch buffer; no per-call heap allocation
+	compress_block(*ctx, blk, data_out, nullptr, ctx->working_buffers[thread_index]);
+
+	return ASTCENC_SUCCESS;
+}
+
+#endif
+
+/* See header for documentation. */
+astcenc_error astcenc_decompress_block(
+	astcenc_context* ctxo,
+	const uint8_t data[16],
+	astcenc_image* image_outp,
+	const astcenc_swizzle* swizzle,
+	size_t pos_x,
+	size_t pos_y,
+	size_t pos_z
+) {
+	if (!ctxo || !data || !image_outp || !swizzle)
+	{
+		return ASTCENC_ERR_BAD_PARAM;
+	}
+
+	astcenc_contexti* ctx = &ctxo->context;
+
+	astcenc_error status = validate_decompression_swizzle(*swizzle);
+	if (status != ASTCENC_SUCCESS)
+	{
+		return status;
+	}
+
+	const block_size_descriptor& bsd = *ctx->bsd;
+
+	size_t blocks_x = astc::get_block_count_safe(image_outp->dim_x, bsd.dim_x);
+	size_t blocks_y = astc::get_block_count_safe(image_outp->dim_y, bsd.dim_y);
+	size_t blocks_z = astc::get_block_count_safe(image_outp->dim_z, bsd.dim_z);
+	if ((pos_x >= blocks_x) || (pos_y >= blocks_y) || (pos_z >= blocks_z))
+	{
+		return ASTCENC_ERR_BAD_PARAM;
+	}
+
+	astcenc_image image_out = *image_outp;
+	size_t texel_count = validate_image(image_out, ctx->config.block_z);
+	if (texel_count == 0)
+	{
+		return ASTCENC_ERR_BAD_PARAM;
+	}
+
+	image_block blk {};
+	blk.texel_count = static_cast<uint8_t>(bsd.dim_x * bsd.dim_y * bsd.dim_z);
+	blk.decode_unorm8 = image_out.data_type == ASTCENC_TYPE_U8;
+
+	symbolic_compressed_block scb;
+	physical_to_symbolic(bsd, data, scb);
+
+	bool is_valid = decompress_symbolic_block(ctx->config.profile, bsd,
+	                                          pos_x * bsd.dim_x,
+	                                          pos_y * bsd.dim_y,
+	                                          pos_z * bsd.dim_z,
+	                                          scb, blk);
+
+	store_image_block(image_out, blk, bsd,
+	                  pos_x * bsd.dim_x, pos_y * bsd.dim_y, pos_z * bsd.dim_z,
+	                  *swizzle);
+
+	return is_valid ? ASTCENC_SUCCESS : ASTCENC_ERR_BAD_BLOCK;
+}
+
+/* See header for documentation. */
+int astcenc_symbolic_block_is_error(
+	const astcenc_symbolic_block* block
+) {
+	const symbolic_compressed_block* scb =
+		get_symbolic_block_storage(const_cast<astcenc_symbolic_block*>(block), false);
+	if (!scb)
+	{
+		return 0;
+	}
+
+	return scb->block_type == SYM_BTYPE_ERROR ? 1 : 0;
+}
+
+/* See header for documentation. */
+astcenc_error astcenc_get_error_color(
+	astcenc_type data_type,
+	uint8_t color_out[16]
+) {
+	if (!color_out)
+	{
+		return ASTCENC_ERR_BAD_PARAM;
+	}
+
+	// FP32 error color used internally by decompress_symbolic_block(); 0xFFFFE000 is an sNaN
+	float nan_f32 = std::bit_cast<float>(0xFFFFE000u);
+
+	switch (data_type)
+	{
+	case ASTCENC_TYPE_U8:
+		// The U8 store path maps the NaN error texel to opaque magenta
+		for (int i = 0; i < 4; i++)
+		{
+			static const uint8_t magenta[4] { 0xFF, 0x00, 0xFF, 0xFF };
+			color_out[i] = magenta[i];
+		}
+		break;
+
+	case ASTCENC_TYPE_F16:
+	{
+		// Reuse the codec conversion so the pattern is exactly what the F16 store path writes
+		for (int i = 0; i < 4; i++)
+		{
+			uint16_t f16 = float_to_float16(nan_f32);
+			color_out[2 * i] = static_cast<uint8_t>(f16 & 0xFF);
+			color_out[2 * i + 1] = static_cast<uint8_t>(f16 >> 8);
+		}
+		break;
+	}
+
+	case ASTCENC_TYPE_F32:
+		for (int i = 0; i < 4; i++)
+		{
+			uint32_t bits;
+			std::memcpy(&bits, &nan_f32, sizeof(bits));
+			color_out[4 * i] = static_cast<uint8_t>(bits & 0xFF);
+			color_out[4 * i + 1] = static_cast<uint8_t>((bits >> 8) & 0xFF);
+			color_out[4 * i + 2] = static_cast<uint8_t>((bits >> 16) & 0xFF);
+			color_out[4 * i + 3] = static_cast<uint8_t>((bits >> 24) & 0xFF);
+		}
+		break;
+
+	default:
+		return ASTCENC_ERR_BAD_PARAM;
+	}
+
+	return ASTCENC_SUCCESS;
+}
+
+#if defined(ASTCENC_DECOMPRESS_ONLY)
+
+/* See header for documentation. */
+astcenc_error astcenc_symbolic_to_physical(
+	astcenc_context* ctxo,
+	const astcenc_symbolic_block* block,
+	uint8_t data[16]
+) {
+	(void)ctxo;
+	(void)block;
+	(void)data;
+	return ASTCENC_ERR_BAD_CONTEXT;
+}
+
+/* See header for documentation. */
+astcenc_error astcenc_compress_block(
+	astcenc_context* ctxo,
+	const astcenc_image* imagep,
+	const astcenc_swizzle* swizzle,
+	size_t pos_x,
+	size_t pos_y,
+	size_t pos_z,
+	uint8_t data_out[16],
+	size_t thread_index
+) {
+	(void)ctxo;
+	(void)imagep;
+	(void)swizzle;
+	(void)pos_x;
+	(void)pos_y;
+	(void)pos_z;
+	(void)data_out;
+	(void)thread_index;
+	return ASTCENC_ERR_BAD_CONTEXT;
+}
+
+#endif
+
 /* See header for documentation. */
 const char* astcenc_get_error_string(
 	astcenc_error status

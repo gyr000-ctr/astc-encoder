@@ -7,6 +7,20 @@ All performance data on this page is measured on an Intel Xeon w7-3465X clocked
 at 3.9 GHz, running `astcenc` using AVX2 and 12 threads.
 
 <!-- ---------------------------------------------------------------------- -->
+## In development
+
+* **Major API and feature updates:**
+  * **API Change:** Add public single-block entry points so the symbolic and
+    physical block conversions that were previously internal can be driven
+    block by block. The new functions are `astcenc_physical_to_symbolic()`,
+    `astcenc_symbolic_to_physical()`, `astcenc_compress_block()`,
+    `astcenc_decompress_block()`, `astcenc_symbolic_block_is_error()`, and
+    `astcenc_get_error_color()`, with an opaque self-contained
+    `astcenc_symbolic_block` storage type. Block-by-block calls run the same
+    per-block code paths as the whole-image functions, producing byte-for-byte
+    identical output, and perform no heap allocation.
+
+<!-- ---------------------------------------------------------------------- -->
 ## 6.0.0
 
 **Status:** Released November 2026.

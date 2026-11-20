@@ -783,8 +783,51 @@ struct astcenc_block_info
 	uint8_t partition_assignment[216];
 };
 
+#if defined(__cplusplus)
+/** @brief 64 byte aligned raw storage, satisfying every supported SIMD variant up to AVX-512. */
+struct astcenc_aligned_storage
+{
+	alignas(64) uint8_t bytes[256];
+};
+#else
+/** @brief 64 byte aligned raw storage, satisfying every supported SIMD variant up to AVX-512. */
+typedef struct astcenc_aligned_storage
+{
+	_Alignas(64) uint8_t bytes[256];
+} astcenc_aligned_storage;
+#endif
+
 /**
- * Populate a codec config based on default settings.
+ * @brief Opaque storage for a single symbolic (unpacked) compressed block.
+ *
+ * A symbolic block is the codec's intermediate representation between a 16 byte physical bitstream
+ * block and uncompressed texels. The layout is a private implementation detail that varies between
+ * codec builds (e.g. SIMD variants), so applications must treat the contents as opaque and never
+ * access the bytes directly. The storage is deliberately self-contained so that block-level calls
+ * never perform any heap allocation; it can be declared on the stack and reused across calls.
+ *
+ * A storage instance is only valid with a context from the same library build that produced it.
+ * Passing storage that is too small for the linked library is rejected with
+ * @c ASTCENC_ERR_BAD_PARAM rather than causing memory corruption.
+ */
+struct astcenc_symbolic_block
+{
+	/** @brief Size of the storage buffer, in bytes. */
+	size_t size;
+
+	/** @brief Opaque storage for the codec-private symbolic block representation. */
+	struct astcenc_aligned_storage storage;
+};
+
+/** @brief Minimum required value of the symbolic block size field, in bytes. */
+#if defined(__cplusplus)
+static const size_t ASTCENC_SYMBOLIC_BLOCK_MIN_SIZE = sizeof(astcenc_symbolic_block);
+#else
+#define ASTCENC_SYMBOLIC_BLOCK_MIN_SIZE (sizeof(struct astcenc_symbolic_block))
+#endif
+
+/**
+ * @brief Populate a codec config based on default settings.
  *
  * Power users can edit the returned config struct to fine tune before allocating the context.
  *
@@ -969,6 +1012,154 @@ ASTCENC_PUBLIC enum astcenc_error astcenc_get_block_info(
 	struct astcenc_context* context,
 	const uint8_t data[16],
 	struct astcenc_block_info* info);
+
+/**
+ * @brief Decode a single 16 byte physical block into a symbolic block.
+ *
+ * This is the block-level equivalent of the first stage of @c astcenc_decompress_image(). It can
+ * cope with arbitrary input data; a block with an invalid or unsupported encoding is flagged as an
+ * error block via @c astcenc_symbolic_block_is_error() rather than failing the call.
+ *
+ * This function performs no heap allocation. The symbolic block is written into caller-provided
+ * storage, which must remain valid for the call.
+ *
+ * @param      context   Codec context, which determines the target block footprint.
+ * @param      data      One block of compressed ASTC data (16 bytes).
+ * @param[out] block     The output symbolic block storage.
+ *
+ * @return @c ASTCENC_SUCCESS if the block was decoded (including an error block), or an error code
+ *         if the arguments are invalid.
+ */
+ASTCENC_PUBLIC enum astcenc_error astcenc_physical_to_symbolic(
+	struct astcenc_context* context,
+	const uint8_t data[16],
+	struct astcenc_symbolic_block* block);
+
+/**
+ * @brief Encode a single symbolic block into a 16 byte physical block.
+ *
+ * This is the inverse of @c astcenc_physical_to_symbolic(). The symbolic block must be a valid
+ * encodable block produced by @c astcenc_compress_block() or a successful
+ * @c astcenc_physical_to_symbolic() call; symbolic blocks flagged as errors cannot be encoded.
+ *
+ * This function performs no heap allocation.
+ *
+ * @param      context   Codec context, which determines the target block footprint.
+ * @param      block     The input symbolic block.
+ * @param[out] data      The output physical block (16 bytes).
+ *
+ * @return @c ASTCENC_SUCCESS if the block was encoded, @c ASTCENC_ERR_BAD_BLOCK if the symbolic
+ *         block is an error block, or an error code if the arguments are invalid.
+ */
+ASTCENC_PUBLIC enum astcenc_error astcenc_symbolic_to_physical(
+	struct astcenc_context* context,
+	const struct astcenc_symbolic_block* block,
+	uint8_t data[16]);
+
+/**
+ * @brief Decompress a single physical block into uncompressed texels.
+ *
+ * This runs the exact same per-block code path as @c astcenc_decompress_image(), so decoding an
+ * image block by block with this function produces output that is byte-for-byte identical to
+ * decoding the whole image in one call. Texels are written for the full block footprint; blocks on
+ * the edge of a non-multiple image still decode a full block, with out-of-range texels filled using
+ * the codec's edge clamping.
+ *
+ * Invalid blocks, including HDR encodings decoded with an LDR profile, are decoded using the error
+ * fallback color and the call returns @c ASTCENC_ERR_BAD_BLOCK. All texels are still written.
+ *
+ * This function performs no heap allocation.
+ *
+ * @param         context     Codec context, which determines the target block footprint and profile.
+ * @param         data        One block of compressed ASTC data (16 bytes).
+ * @param[in,out] image_out   Output image. Only texels covered by this block are written.
+ * @param         swizzle     Decompression data swizzle, applied after decompression.
+ * @param         pos_x       The block X coordinate in the output image, in blocks.
+ * @param         pos_y       The block Y coordinate in the output image, in blocks.
+ * @param         pos_z       The block Z coordinate in the output image, in blocks.
+ *
+ * @return @c ASTCENC_SUCCESS on success, or @c ASTCENC_ERR_BAD_BLOCK if the block decoded as an
+ *         error block, or another error code if the arguments are invalid.
+ */
+ASTCENC_PUBLIC enum astcenc_error astcenc_decompress_block(
+	struct astcenc_context* context,
+	const uint8_t data[16],
+	struct astcenc_image* image_out,
+	const struct astcenc_swizzle* swizzle,
+	size_t pos_x,
+	size_t pos_y,
+	size_t pos_z);
+
+/**
+ * @brief Compress a single block of uncompressed texels into a 16 byte physical block.
+ *
+ * This runs the exact same per-block code path as @c astcenc_compress_image(), using the context's
+ * quality preset, profile, swizzle handling, and error weighting. Compressing an image block by
+ * block with this function produces output that is byte-for-byte identical to compressing the whole
+ * image in one call (for contexts configured without LZ-RDO).
+ *
+ * This function performs no heap allocation; it reuses the context scratch buffer assigned to
+ * @c thread_index. A single scratch buffer must not be used concurrently from multiple threads.
+ *
+ * @param         context       Codec context.
+ * @param         image         Input image. Only texels covered by this block are read.
+ * @param         swizzle       Compression data swizzle, applied before compression.
+ * @param         pos_x         The block X coordinate in the input image, in blocks.
+ * @param         pos_y         The block Y coordinate in the input image, in blocks.
+ * @param         pos_z         The block Z coordinate in the input image, in blocks.
+ * @param[out]    data_out      The output physical block (16 bytes).
+ * @param         thread_index  Thread index [0..N-1] selecting the context scratch buffer.
+ *
+ * @return @c ASTCENC_SUCCESS on success, or an error code if the arguments are invalid or the
+ *         context is decompress-only.
+ */
+ASTCENC_PUBLIC enum astcenc_error astcenc_compress_block(
+	struct astcenc_context* context,
+	const struct astcenc_image* image,
+	const struct astcenc_swizzle* swizzle,
+	size_t pos_x,
+	size_t pos_y,
+	size_t pos_z,
+	uint8_t data_out[16],
+	size_t thread_index);
+
+/**
+ * @brief Test whether a symbolic block represents an invalid error encoding.
+ *
+ * Error blocks decode to the profile-independent fallback color: magenta @c (255, 0, 255, 255)
+ * for 8-bit unorm output, and a signaling NaN per component for half-float and float output. Use
+ * @c astcenc_get_error_color() to obtain the exact fallback bytes for an output type.
+ *
+ * @param      block   The symbolic block to query.
+ *
+ * @return Non-zero if the block is an error block, zero otherwise.
+ */
+ASTCENC_PUBLIC int astcenc_symbolic_block_is_error(
+	const struct astcenc_symbolic_block* block);
+
+/**
+ * @brief Get the fallback color written when an invalid error block is decoded.
+ *
+ * The returned four components use the byte layout of @c data_type and are identical to the texel
+ * bytes produced by @c astcenc_decompress_block() / @c astcenc_decompress_image() when they report
+ * @c ASTCENC_ERR_BAD_BLOCK:
+ *
+ *     * @c ASTCENC_TYPE_U8  - four bytes @c (255, 0, 255, 255).
+ *     * @c ASTCENC_TYPE_F16 - four signaling-NaN half-float values (one 16 bit value each).
+ *     * @c ASTCENC_TYPE_F32 - four signaling-NaN float values (one 32 bit value each).
+ *
+ * The output buffer must hold at least 16 bytes (the largest case, four F32 components).
+ *
+ * This function performs no heap allocation.
+ *
+ * @param      data_type   The output image data type the fallback color is requested for.
+ * @param[out] color_out   The output buffer, at least 16 bytes.
+ *
+ * @return @c ASTCENC_SUCCESS on success, or @c ASTCENC_ERR_BAD_PARAM if the type is invalid.
+ */
+ASTCENC_PUBLIC enum astcenc_error astcenc_get_error_color(
+	enum astcenc_type data_type,
+	uint8_t color_out[16]);
 
 /**
  * @brief Get a printable string for a specific status code.
