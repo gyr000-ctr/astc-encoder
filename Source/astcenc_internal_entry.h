@@ -184,6 +184,17 @@ public:
 	}
 
 	/**
+	 * @brief Check if the current operation has been cancelled.
+	 *
+	 * @return True if @c cancel() has been called since the last @c reset().
+	 */
+	bool is_cancelled()
+	{
+		std::lock_guard<std::mutex> lck(m_lock);
+		return m_is_cancelled;
+	}
+
+	/**
 	 * @brief Trigger the pipeline stage init step.
 	 *
 	 * This can be called from multi-threaded code. The first thread to hit this will process the

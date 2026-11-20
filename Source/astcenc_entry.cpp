@@ -1431,8 +1431,16 @@ astcenc_error astcenc_decompress_image(
 			break;
 		}
 
+		bool is_cancelled = false;
 		for (size_t i = base; i < base + count; i++)
 		{
+			// Stop promptly on cancellation, within a single block decode
+			if (ctxo->manage_decompress.is_cancelled())
+			{
+				is_cancelled = true;
+				break;
+			}
+
 			// Decode i into x, y, z block indices
 			size_t z = i / plane_blocks;
 			size_t rem = i - (z * plane_blocks);
@@ -1461,7 +1469,19 @@ astcenc_error astcenc_decompress_image(
 			                  *swizzle);
 		}
 
+		// Complete the full assignment, even if abandoned, so wait() can release threads
 		ctxo->manage_decompress.complete_task_assignment(count);
+
+		if (is_cancelled)
+		{
+			break;
+		}
+	}
+
+	// Cancellation takes precedence so partial output is never reported as success
+	if (ctxo->manage_decompress.is_cancelled())
+	{
+		return ASTCENC_ERR_CANCELLED;
 	}
 
 	return status;
@@ -1472,6 +1492,14 @@ astcenc_error astcenc_decompress_reset(
 	astcenc_context* ctxo
 ) {
 	ctxo->manage_decompress.reset();
+	return ASTCENC_SUCCESS;
+}
+
+/* See header for documentation. */
+astcenc_error astcenc_decompress_cancel(
+	astcenc_context* ctxo
+) {
+	ctxo->manage_decompress.cancel();
 	return ASTCENC_SUCCESS;
 }
 
@@ -1627,6 +1655,8 @@ const char* astcenc_get_error_string(
 		return "ASTCENC_ERR_BAD_DECODE_MODE";
 	case ASTCENC_ERR_BAD_BLOCK:
 		return "ASTCENC_ERR_BAD_BLOCK";
+	case ASTCENC_ERR_CANCELLED:
+		return "ASTCENC_ERR_CANCELLED";
 #if defined(ASTCENC_DIAGNOSTICS)
 	case ASTCENC_ERR_DTRACE_FAILURE:
 		return "ASTCENC_ERR_DTRACE_FAILURE";

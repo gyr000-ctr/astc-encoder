@@ -232,6 +232,8 @@ enum astcenc_error {
 	ASTCENC_ERR_BAD_DECODE_MODE,
 	/** @brief A compressed block is invalid or unsupported by the decoding context. */
 	ASTCENC_ERR_BAD_BLOCK,
+	/** @brief The call was cancelled by the user before it completed. */
+	ASTCENC_ERR_CANCELLED,
 #if defined(ASTCENC_DIAGNOSTICS)
 	/** @brief The call failed due to an issue with diagnostic tracing. */
 	ASTCENC_ERR_DTRACE_FAILURE,
@@ -910,6 +912,10 @@ ASTCENC_PUBLIC enum astcenc_error astcenc_compress_cancel(
  * For multi-threaded contexts, each call reports errors in the blocks assigned to that thread.
  * The caller must check the return value from every worker thread to detect all decode errors.
  *
+ * If the operation is cancelled via @c astcenc_decompress_cancel() each thread stops issuing new
+ * block decodes and returns @c ASTCENC_ERR_CANCELLED. The output image will be partially written
+ * and must be treated as undefined; it is not a valid half-decoded image.
+ *
  * @param         context        Codec context.
  * @param[in]     data           Pointer to compressed data.
  * @param         data_len       Length of the compressed data, in bytes.
@@ -917,7 +923,8 @@ ASTCENC_PUBLIC enum astcenc_error astcenc_compress_cancel(
  * @param         swizzle        Decompression data swizzle, applied after decompression.
  * @param         thread_index   Thread index [0..N-1] of calling thread.
  *
- * @return @c ASTCENC_SUCCESS on success, or an error if decompression failed.
+ * @return @c ASTCENC_SUCCESS on success, @c ASTCENC_ERR_CANCELLED if cancelled, or an error if
+ * decompression failed.
  */
 ASTCENC_PUBLIC enum astcenc_error astcenc_decompress_image(
 	struct astcenc_context* context,
@@ -941,6 +948,24 @@ ASTCENC_PUBLIC enum astcenc_error astcenc_decompress_image(
  * @return @c ASTCENC_SUCCESS on success, or an error if reset failed.
  */
 ASTCENC_PUBLIC enum astcenc_error astcenc_decompress_reset(
+	struct astcenc_context* context);
+
+/**
+ * @brief Cancel any pending decompression operation.
+ *
+ * Threads actively running @c astcenc_decompress_image() stop decoding new blocks and return
+ * @c ASTCENC_ERR_CANCELLED; any block already being decoded completes normally. The output image
+ * is left partially written and must be treated as undefined.
+ *
+ * The caller must behave as if the decompression completed normally, even though the data will be
+ * undefined. They are still responsible for synchronizing threads in the worker thread pool, and
+ * must call reset before starting another decompression.
+ *
+ * @param context   Codec context.
+ *
+ * @return @c ASTCENC_SUCCESS on success, or an error if cancellation failed.
+ */
+ASTCENC_PUBLIC enum astcenc_error astcenc_decompress_cancel(
 	struct astcenc_context* context);
 
 /**
